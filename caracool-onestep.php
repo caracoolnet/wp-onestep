@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
- * Description: Desactiva los comentarios en todo el sitio y activa un modo de mantenimiento con página personalizable. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.0.1
+ * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable e inserta código personalizado en el head/footer. Plugin ligero de Caracool, sin dependencias externas.
+ * Version:     1.1.0
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.0.1' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.1.0' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -51,6 +51,8 @@ class Caracool_OneStep {
         // Prioridad 0: que se ejecute antes que cualquier otra cosa enganchada
         // a template_redirect (redirecciones canónicas, SEO, cache, etc.).
         add_action( 'template_redirect', [ $this, 'maintenance_maybe_render' ], 0 );
+
+        $this->snippets_bootstrap( $settings );
     }
 
     // ── Ajustes por defecto ───────────────────────────────────
@@ -74,47 +76,113 @@ class Caracool_OneStep {
             'maintenance_bypass_role'     => 'administrator',
             'maintenance_ip_whitelist'    => [],
             'maintenance_show_credit'     => true,
+
+            // Código personalizado (snippets de head/footer)
+            'snippets' => [],
         ] );
     }
 
     // ── Guardar ajustes ───────────────────────────────────────
+    // Hay dos <form> en la página de ajustes: el principal (Comentarios +
+    // Mantenimiento) y el de Código personalizado, que va aparte porque su
+    // lista de snippets se edita como bloques repetibles. Ambos apuntan a
+    // esta misma acción, así que partimos siempre de los ajustes actuales y
+    // solo sobrescribimos el subconjunto de claves del formulario enviado
+    // (marcado con el campo oculto "co_form"), para no borrar sin querer la
+    // otra pestaña.
     public function save_settings() {
         if ( ! current_user_can( 'manage_options' ) ) wp_die( 'No autorizado.' );
         check_admin_referer( 'caracool_onestep_save' );
 
-        $ip_raw  = sanitize_textarea_field( wp_unslash( $_POST['maintenance_ip_whitelist'] ?? '' ) );
-        $ip_list = array_filter( array_map( 'trim', preg_split( '/[\r\n,]+/', $ip_raw ) ) );
-        $ip_list = array_values( array_unique( array_filter( $ip_list, function ( $ip ) {
-            return (bool) filter_var( $ip, FILTER_VALIDATE_IP );
-        } ) ) );
+        $current = $this->get_settings();
+        $form    = sanitize_key( wp_unslash( $_POST['co_form'] ?? 'main' ) );
 
-        $status = absint( $_POST['maintenance_http_status'] ?? 503 );
-        if ( ! in_array( $status, [ 200, 503, 404, 301 ], true ) ) $status = 503;
+        if ( 'snippets' === $form ) {
+            $overrides = [
+                'snippets' => $this->snippets_parse_from_post(),
+            ];
+        } else {
+            $ip_raw  = sanitize_textarea_field( wp_unslash( $_POST['maintenance_ip_whitelist'] ?? '' ) );
+            $ip_list = array_filter( array_map( 'trim', preg_split( '/[\r\n,]+/', $ip_raw ) ) );
+            $ip_list = array_values( array_unique( array_filter( $ip_list, function ( $ip ) {
+                return (bool) filter_var( $ip, FILTER_VALIDATE_IP );
+            } ) ) );
 
-        $bypass_role = sanitize_text_field( $_POST['maintenance_bypass_role'] ?? '' );
-        if ( $bypass_role && ! in_array( $bypass_role, self::ROLE_ORDER, true ) ) $bypass_role = '';
+            $status = absint( $_POST['maintenance_http_status'] ?? 503 );
+            if ( ! in_array( $status, [ 200, 503, 404, 301 ], true ) ) $status = 503;
 
-        update_option( self::OPTION_KEY, [
-            'comments_disabled'           => ! empty( $_POST['comments_disabled'] ),
+            $bypass_role = sanitize_text_field( $_POST['maintenance_bypass_role'] ?? '' );
+            if ( $bypass_role && ! in_array( $bypass_role, self::ROLE_ORDER, true ) ) $bypass_role = '';
 
-            'maintenance_enabled'         => ! empty( $_POST['maintenance_enabled'] ),
-            'maintenance_http_status'     => $status,
-            'maintenance_redirect_url'    => esc_url_raw( $_POST['maintenance_redirect_url'] ?? '' ),
-            'maintenance_title'           => sanitize_text_field( $_POST['maintenance_title'] ?? '' ),
-            'maintenance_heading'         => sanitize_text_field( $_POST['maintenance_heading'] ?? '' ),
-            'maintenance_message'         => sanitize_textarea_field( $_POST['maintenance_message'] ?? '' ),
-            'maintenance_logo_url'        => esc_url_raw( $_POST['maintenance_logo_url'] ?? '' ),
-            'maintenance_bg_color'        => sanitize_hex_color( $_POST['maintenance_bg_color'] ?? '' ) ?: '#14141a',
-            'maintenance_text_color'      => sanitize_hex_color( $_POST['maintenance_text_color'] ?? '' ) ?: '#ffffff',
-            'maintenance_use_custom_html' => ! empty( $_POST['maintenance_use_custom_html'] ),
-            'maintenance_custom_html'     => wp_kses_post( $_POST['maintenance_custom_html'] ?? '' ),
-            'maintenance_bypass_role'     => $bypass_role,
-            'maintenance_ip_whitelist'    => $ip_list,
-            'maintenance_show_credit'     => ! empty( $_POST['maintenance_show_credit'] ),
-        ] );
+            $overrides = [
+                'comments_disabled'           => ! empty( $_POST['comments_disabled'] ),
 
-        wp_safe_redirect( admin_url( 'admin.php?page=' . CARACOOL_ONESTEP_SLUG . '&saved=1' ) );
+                'maintenance_enabled'         => ! empty( $_POST['maintenance_enabled'] ),
+                'maintenance_http_status'     => $status,
+                'maintenance_redirect_url'    => esc_url_raw( $_POST['maintenance_redirect_url'] ?? '' ),
+                'maintenance_title'           => sanitize_text_field( $_POST['maintenance_title'] ?? '' ),
+                'maintenance_heading'         => sanitize_text_field( $_POST['maintenance_heading'] ?? '' ),
+                'maintenance_message'         => sanitize_textarea_field( $_POST['maintenance_message'] ?? '' ),
+                'maintenance_logo_url'        => esc_url_raw( $_POST['maintenance_logo_url'] ?? '' ),
+                'maintenance_bg_color'        => sanitize_hex_color( $_POST['maintenance_bg_color'] ?? '' ) ?: '#14141a',
+                'maintenance_text_color'      => sanitize_hex_color( $_POST['maintenance_text_color'] ?? '' ) ?: '#ffffff',
+                'maintenance_use_custom_html' => ! empty( $_POST['maintenance_use_custom_html'] ),
+                'maintenance_custom_html'     => wp_kses_post( $_POST['maintenance_custom_html'] ?? '' ),
+                'maintenance_bypass_role'     => $bypass_role,
+                'maintenance_ip_whitelist'    => $ip_list,
+                'maintenance_show_credit'     => ! empty( $_POST['maintenance_show_credit'] ),
+            ];
+        }
+
+        update_option( self::OPTION_KEY, array_merge( $current, $overrides ) );
+
+        // Recordamos en qué pestaña estaba para no devolver siempre a
+        // "Comentarios" tras guardar — ver el campo oculto "co_active_tab"
+        // en el formulario principal, y el JS que lo mantiene actualizado.
+        if ( 'snippets' === $form ) {
+            $active_tab = 'tab-codigo';
+        } else {
+            $posted_tab = sanitize_key( wp_unslash( $_POST['co_active_tab'] ?? '' ) );
+            $active_tab = in_array( $posted_tab, [ 'tab-comentarios', 'tab-mantenimiento' ], true ) ? $posted_tab : 'tab-comentarios';
+        }
+
+        wp_safe_redirect( admin_url( 'admin.php?page=' . CARACOOL_ONESTEP_SLUG . '&saved=1&tab=' . $active_tab ) );
         exit;
+    }
+
+    /**
+     * Lee los bloques "snippets[IDX][campo]" del formulario de Código
+     * personalizado y los convierte en el array que se guarda en 'snippets'.
+     * Se descartan los bloques vacíos (sin nombre y sin código) para que
+     * añadir una fila y no rellenarla no deje basura guardada.
+     */
+    private function snippets_parse_from_post() {
+        $posted   = (array) ( $_POST['snippets'] ?? [] );
+        $snippets = [];
+
+        foreach ( $posted as $row ) {
+            $name = sanitize_text_field( wp_unslash( $row['name'] ?? '' ) );
+            $code = wp_unslash( $row['code'] ?? '' ); // no se sanea el HTML/JS a propósito, ver nota en snippets_bootstrap()
+
+            if ( '' === trim( $name ) && '' === trim( $code ) ) continue; // fila vacía, se descarta
+
+            $location = in_array( $row['location'] ?? '', [ 'head', 'footer' ], true ) ? $row['location'] : 'footer';
+            $visibility = in_array( $row['visibility'] ?? '', [ 'all', 'all_except', 'only' ], true ) ? $row['visibility'] : 'all';
+
+            $urls_raw = sanitize_textarea_field( wp_unslash( $row['urls'] ?? '' ) );
+            $urls     = array_values( array_filter( array_map( 'trim', preg_split( '/[\r\n]+/', $urls_raw ) ) ) );
+
+            $snippets[] = [
+                'name'       => $name,
+                'code'       => $code,
+                'location'   => $location,
+                'active'     => ! empty( $row['active'] ),
+                'visibility' => $visibility,
+                'urls'       => $urls,
+            ];
+        }
+
+        return $snippets;
     }
 
     // ── Avisos admin ──────────────────────────────────────────
@@ -124,11 +192,6 @@ class Caracool_OneStep {
 
         if ( isset( $_GET['saved'] ) ) {
             echo '<div class="notice notice-success is-dismissible"><p>✅ Configuración guardada.</p></div>';
-        }
-
-        $s = $this->get_settings();
-        if ( ! empty( $s['maintenance_enabled'] ) ) {
-            echo '<div class="notice notice-warning"><p>🚧 El <strong>modo mantenimiento</strong> está activo: solo lo saltan los usuarios/IPs autorizados en la pestaña "Mantenimiento".</p></div>';
         }
     }
 
@@ -157,189 +220,488 @@ class Caracool_OneStep {
         if ( ! current_user_can( 'manage_options' ) ) return;
 
         $s = $this->get_settings();
-        ?>
-        <div class="wrap" style="max-width:900px;">
-            <div style="display:flex;align-items:center;gap:16px;margin-top:10px;">
-                <?php echo self::logo_svg(); // phpcs:ignore -- markup fijo, sin datos de usuario ?>
-                <h1 style="margin:0;padding:0;line-height:1.3;">
-                    OneStep <span style="font-size:12px;color:#888;font-weight:normal;">v<?php echo esc_html( CARACOOL_ONESTEP_VERSION ); ?></span>
-                </h1>
-            </div>
-            <p class="description" style="margin-top:14px;">Comentarios y modo mantenimiento en un único plugin ligero, sin dependencias externas.</p>
 
-            <h2 class="nav-tab-wrapper" style="margin-top:16px;">
-                <a href="#tab-comentarios" class="nav-tab nav-tab-active" data-co-tab="tab-comentarios">💬 Comentarios</a>
-                <a href="#tab-mantenimiento" class="nav-tab" data-co-tab="tab-mantenimiento">🚧 Mantenimiento</a>
-            </h2>
+        // Qué pestaña mostrar activa al cargar: la que venga en la URL tras
+        // guardar (ver save_settings()), o "Comentarios" por defecto.
+        $co_valid_tabs = [ 'tab-comentarios', 'tab-mantenimiento', 'tab-codigo' ];
+        $active_tab    = isset( $_GET['tab'] ) && in_array( $_GET['tab'], $co_valid_tabs, true ) ? sanitize_key( $_GET['tab'] ) : 'tab-comentarios';
+        $co_main_tab   = 'tab-mantenimiento' === $active_tab ? 'tab-mantenimiento' : 'tab-comentarios'; // valor inicial del campo oculto del form principal
+        ?>
+        <div class="wrap co-wrap">
+        <style>
+            .co-wrap{
+                --co-bg:#f6f5f2; --co-panel:#ffffff; --co-border:#e7e4de;
+                --co-ink:#1c1b19; --co-ink-soft:#6b6660; --co-ink-faint:#a29c93;
+                --co-accent:#c1502e; --co-accent-soft:#f4e3dc; --co-accent-ink:#7a3319;
+                --co-ok:#2f7a4f; --co-ok-soft:#e3f1e8;
+                --co-radius-lg:16px; --co-radius-md:10px; --co-radius-sm:7px;
+                --co-shadow:0 1px 2px rgba(28,27,25,.04), 0 8px 24px -12px rgba(28,27,25,.12);
+                --co-mono: ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+                max-width:900px;
+            }
+            .co-wrap *{ box-sizing:border-box; }
+            .co-head{ display:flex; align-items:center; justify-content:space-between; gap:20px; margin:18px 0 26px; flex-wrap:wrap; }
+            .co-head-id{ display:flex; align-items:center; gap:14px; }
+            .co-logo{ width:100px; height:auto; display:block; fill:var(--co-ink); flex-shrink:0; }
+            .co-head-titles h1{ margin:0; padding:0; font-size:20px; font-weight:650; letter-spacing:-.01em; line-height:1.3; }
+            .co-ver-pill{ font-size:11px; font-weight:600; color:var(--co-ink-soft); background:var(--co-panel); border:1px solid var(--co-border); padding:3px 9px; border-radius:999px; letter-spacing:.02em; margin-left:6px; vertical-align:2px; }
+            .co-head-sub{ margin:4px 0 0; font-size:13px; color:var(--co-ink-soft); }
+            .co-status-chip{ display:inline-flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600; color:var(--co-ok); background:var(--co-ok-soft); border-radius:999px; padding:6px 12px 6px 10px; white-space:nowrap; }
+            .co-status-chip .co-dot{ width:6px; height:6px; border-radius:50%; background:var(--co-ok); }
+
+            .co-tabs{ display:flex; gap:4px; background:var(--co-panel); border:1px solid var(--co-border); border-radius:var(--co-radius-md); padding:4px; margin-bottom:22px; width:max-content; }
+            .co-tab{ display:flex; align-items:center; gap:7px; border:none; background:transparent; font:inherit; font-size:13.5px; font-weight:560; color:var(--co-ink-soft); padding:8px 14px; border-radius:7px; cursor:pointer; transition:background .12s,color .12s; }
+            .co-tab svg{ width:16px; height:16px; opacity:.75; }
+            .co-tab:hover{ background:#f1efeb; color:var(--co-ink); }
+            .co-tab.active{ background:var(--co-ink); color:#fff; }
+            .co-tab.active svg{ opacity:1; }
+
+            .co-panel{ display:none; }
+            .co-panel.active{ display:block; }
+
+            .co-card{ background:var(--co-panel); border:1px solid var(--co-border); border-radius:var(--co-radius-lg); box-shadow:var(--co-shadow); padding:24px 26px; margin-bottom:16px; }
+            .co-card-head{ display:flex; align-items:center; gap:11px; margin-bottom:4px; }
+            .co-card-icon{ width:32px; height:32px; border-radius:9px; background:var(--co-accent-soft); color:var(--co-accent-ink); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+            .co-card-icon svg{ width:17px; height:17px; }
+            .co-card-head h2{ margin:0; padding:0; border:0; font-size:14.5px; font-weight:640; letter-spacing:-.005em; }
+            .co-card-desc{ margin:10px 0 0; font-size:13px; line-height:1.55; color:var(--co-ink-soft); }
+            .co-card-desc code{ background:#f1efeb; border-radius:4px; padding:1px 5px; font-size:12px; font-family:var(--co-mono); }
+
+            .co-toggle-row{ display:flex; align-items:flex-start; justify-content:space-between; gap:20px; padding-top:16px; }
+            .co-toggle-row .co-label{ font-size:14px; font-weight:570; }
+            .co-toggle-row .co-hint{ margin:4px 0 0; font-size:12.5px; color:var(--co-ink-soft); max-width:520px; line-height:1.5; }
+            .co-switch{ position:relative; width:40px; height:24px; flex-shrink:0; margin-top:1px; display:block; cursor:pointer; }
+            .co-switch.co-switch-sm{ width:32px; height:19px; margin-top:0; }
+            .co-switch input{ opacity:0; width:0; height:0; position:absolute; }
+            .co-switch .co-track{ position:absolute; inset:0; background:#dcd8d1; border-radius:999px; transition:.15s; }
+            .co-switch .co-track::before{ content:""; position:absolute; width:18px; height:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.15s; box-shadow:0 1px 2px rgba(0,0,0,.25); }
+            .co-switch.co-switch-sm .co-track::before{ width:13px; height:13px; left:3px; top:3px; }
+            .co-switch input:checked + .co-track{ background:var(--co-ink); }
+            .co-switch input:checked + .co-track::before{ transform:translateX(16px); }
+            .co-switch.co-switch-sm input:checked + .co-track::before{ transform:translateX(13px); }
+
+            .co-field-grid{ display:grid; grid-template-columns:190px 1fr; gap:14px 18px; align-items:start; margin-top:18px; }
+            .co-field-grid label{ font-size:13px; font-weight:570; padding-top:9px; }
+            .co-field-grid .co-field-hint{ grid-column:2; margin:-6px 0 0; font-size:12px; color:var(--co-ink-faint); }
+            .co-wrap input[type=text], .co-wrap input[type=url], .co-wrap select, .co-wrap textarea{
+                width:100%; font:inherit; font-size:13.5px; padding:9px 11px;
+                border:1px solid var(--co-border); border-radius:var(--co-radius-sm);
+                background:#fdfcfb; color:var(--co-ink);
+            }
+            .co-wrap textarea.code{ font-family:var(--co-mono); font-size:12.5px; }
+            .co-wrap input[type=text]:focus, .co-wrap input[type=url]:focus, .co-wrap select:focus, .co-wrap textarea:focus{
+                outline:none; border-color:var(--co-ink); box-shadow:0 0 0 3px rgba(28,27,25,.08);
+            }
+
+            .co-pill-select{ display:inline-flex; flex-wrap:wrap; border:1px solid var(--co-border); border-radius:999px; padding:3px; gap:2px; background:#fdfcfb; }
+            .co-pill-select label{ position:relative; font-size:12.5px; font-weight:560; color:var(--co-ink-soft); padding:6px 12px; border-radius:999px; cursor:pointer; }
+            .co-pill-select label.on{ background:var(--co-ink); color:#fff; }
+            .co-pill-select input{ position:absolute; opacity:0; width:0; height:0; }
+
+            .co-snippet{ border:1px solid var(--co-border); border-radius:var(--co-radius-md); padding:16px 18px; margin-top:14px; }
+            .co-snippet-top{ display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+            .co-snippet-top .co-name-input{ font-weight:600; max-width:280px; border:none; background:transparent; padding:6px 0; }
+            .co-snippet-meta{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+            .co-badge{ font-size:11px; font-weight:650; padding:3px 8px; border-radius:999px; background:var(--co-accent-soft); color:var(--co-accent-ink); white-space:nowrap; }
+            .co-badge.muted{ background:#efeceb; color:var(--co-ink-soft); }
+            .co-icon-btn{ width:28px; height:28px; border-radius:7px; border:1px solid var(--co-border); background:#fff; display:flex; align-items:center; justify-content:center; cursor:pointer; color:var(--co-ink-soft); }
+            .co-icon-btn:hover{ color:#b8382c; border-color:#e7c3bb; }
+            .co-icon-btn svg{ width:14px; height:14px; }
+            .co-snippet-fields{ display:grid; grid-template-columns:1fr 1fr; gap:10px 14px; margin-top:12px; }
+            .co-snippet-fields .co-full{ grid-column:1 / -1; }
+            .co-snippet-fields label{ display:block; font-size:11.5px; font-weight:610; color:var(--co-ink-soft); margin-bottom:4px; text-transform:uppercase; letter-spacing:.03em; }
+            .co-field-hint{ font-size:12px; color:var(--co-ink-faint); }
+            .co-field-hint code{ background:#f1efeb; border-radius:4px; padding:1px 5px; font-size:11px; font-family:var(--co-mono); }
+
+            .co-btn-row{ display:flex; align-items:center; gap:10px; margin-top:22px; flex-wrap:wrap; }
+            .co-btn{ font:inherit; font-size:13.5px; font-weight:610; padding:10px 18px; border-radius:999px; border:1px solid transparent; cursor:pointer; display:inline-flex; align-items:center; gap:7px; text-decoration:none; }
+            .co-btn-primary{ background:var(--co-ink); color:#fff; }
+            .co-btn-primary:hover{ background:#000; color:#fff; }
+            .co-btn-ghost{ background:transparent; border-color:var(--co-border); color:var(--co-ink); }
+            .co-btn-ghost:hover{ background:#f1efeb; color:var(--co-ink); }
+            .co-btn svg{ width:14px; height:14px; }
+
+            .co-foot-credit{ text-align:center; font-size:11.5px; color:var(--co-ink-faint); margin-top:34px; }
+        </style>
+
+        <div class="co-head">
+            <div class="co-head-id">
+                <?php echo self::logo_svg(); // phpcs:ignore -- markup fijo, sin datos de usuario ?>
+                <div class="co-head-titles">
+                    <h1>OneStep <span class="co-ver-pill">v<?php echo esc_html( CARACOOL_ONESTEP_VERSION ); ?></span></h1>
+                    <p class="co-head-sub">Comentarios, mantenimiento y código personalizado — un plugin, sin dependencias</p>
+                </div>
+            </div>
+            <div class="co-status-chip"><span class="co-dot"></span>Activo</div>
+        </div>
+
+        <div class="co-tabs">
+            <button type="button" class="co-tab <?php echo 'tab-comentarios' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-comentarios">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Comentarios
+            </button>
+            <button type="button" class="co-tab <?php echo 'tab-mantenimiento' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-mantenimiento">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Mantenimiento
+            </button>
+            <button type="button" class="co-tab <?php echo 'tab-codigo' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-codigo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Código
+            </button>
+        </div>
 
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <?php wp_nonce_field( 'caracool_onestep_save' ); ?>
                 <input type="hidden" name="action" value="caracool_onestep_save">
+                <input type="hidden" name="co_form" value="main">
+                <input type="hidden" name="co_active_tab" id="co-active-tab-input" value="<?php echo esc_attr( $co_main_tab ); ?>">
 
                 <!-- ── TAB: COMENTARIOS ── -->
-                <div id="tab-comentarios" class="co-tab-panel">
-                    <div style="background:#fff;border:1px solid #c3c4c7;border-radius:6px;padding:20px 24px;margin-top:16px;">
-                        <h2 style="margin-top:0;border-bottom:1px solid #f0f0f1;padding-bottom:10px;font-size:14px;">💬 Comentarios</h2>
-                        <label style="font-size:14px;">
-                            <input type="checkbox" name="comments_disabled" value="1" <?php checked( $s['comments_disabled'] ); ?>>
-                            Desactivar comentarios en todo WordPress, incluido a través de REST y XML-RPC
-                        </label>
-                        <p class="description" style="margin-top:10px;">
-                            Al activarlo se cierran los comentarios y pingbacks en todos los tipos de contenido,
-                            se ocultan del menú de administración, del panel de Ajustes → Comentarios, de la barra
-                            de admin y del escritorio, se bloquea por completo el endpoint REST (<code>/wp/v2/comments</code>)
-                            y el método XML-RPC (<code>wp.newComment</code>), y se elimina el formulario de comentarios
-                            de las plantillas del tema.
-                        </p>
+                <div id="tab-comentarios" class="co-tab-panel co-panel <?php echo 'tab-comentarios' === $active_tab ? 'active' : ''; ?>">
+                    <div class="co-card">
+                        <div class="co-card-head">
+                            <div class="co-card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <h2>Comentarios</h2>
+                        </div>
+                        <div class="co-toggle-row">
+                            <div>
+                                <div class="co-label">Desactivar comentarios en todo WordPress</div>
+                                <p class="co-hint">Incluye REST y XML-RPC. Se cierran comentarios y pingbacks en todos los tipos de contenido, se ocultan del menú de administración, del panel de Ajustes → Comentarios, de la barra de admin y del escritorio, se bloquea el endpoint REST (<code>/wp/v2/comments</code>) y el método XML-RPC (<code>wp.newComment</code>), y se elimina el formulario de comentarios del tema.</p>
+                            </div>
+                            <label class="co-switch">
+                                <input type="checkbox" name="comments_disabled" value="1" <?php checked( $s['comments_disabled'] ); ?>>
+                                <span class="co-track"></span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="co-btn-row">
+                        <button type="submit" class="co-btn co-btn-primary">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            Guardar configuración
+                        </button>
                     </div>
                 </div>
 
                 <!-- ── TAB: MANTENIMIENTO ── -->
-                <div id="tab-mantenimiento" class="co-tab-panel" style="display:none;">
+                <div id="tab-mantenimiento" class="co-tab-panel co-panel <?php echo 'tab-mantenimiento' === $active_tab ? 'active' : ''; ?>">
 
-                    <div style="background:#fff;border:1px solid #c3c4c7;border-radius:6px;padding:20px 24px;margin-top:16px;">
-                        <h2 style="margin-top:0;border-bottom:1px solid #f0f0f1;padding-bottom:10px;font-size:14px;">🚧 Activación</h2>
-                        <label style="font-size:14px;">
-                            <input type="checkbox" name="maintenance_enabled" value="1" <?php checked( $s['maintenance_enabled'] ); ?>>
-                            Poner toda la web en construcción — solo el administrador logueado ve el sitio real, el resto ve esta página
-                        </label>
-                        <p class="description" style="margin-top:6px;">wp-admin sigue siendo siempre accesible, para poder desactivarlo desde aquí. El "quién puede ver el sitio" se ajusta más abajo.</p>
+                    <div class="co-card">
+                        <div class="co-card-head">
+                            <div class="co-card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <h2>Activación</h2>
+                        </div>
+                        <div class="co-toggle-row">
+                            <div>
+                                <div class="co-label">Poner toda la web en construcción</div>
+                                <p class="co-hint">Solo el administrador logueado ve el sitio real; el resto ve la página de mantenimiento. wp-admin sigue siendo siempre accesible. El "quién puede ver el sitio" se ajusta más abajo.</p>
+                            </div>
+                            <label class="co-switch">
+                                <input type="checkbox" name="maintenance_enabled" value="1" <?php checked( $s['maintenance_enabled'] ); ?>>
+                                <span class="co-track"></span>
+                            </label>
+                        </div>
 
-                        <table class="form-table">
-                            <tr>
-                                <th style="width:200px;"><label for="maintenance_http_status">Código HTTP</label></th>
-                                <td>
-                                    <select name="maintenance_http_status" id="maintenance_http_status">
-                                        <option value="503" <?php selected( $s['maintenance_http_status'], 503 ); ?>>503 — Servicio no disponible (recomendado, SEO-friendly)</option>
-                                        <option value="200" <?php selected( $s['maintenance_http_status'], 200 ); ?>>200 — OK</option>
-                                        <option value="404" <?php selected( $s['maintenance_http_status'], 404 ); ?>>404 — No encontrado</option>
-                                        <option value="301" <?php selected( $s['maintenance_http_status'], 301 ); ?>>301 — Redirección permanente</option>
-                                    </select>
-                                    <p class="description">503 le dice a Google que vuelva más tarde sin des-indexar el sitio.</p>
-                                </td>
-                            </tr>
-                            <tr id="co-redirect-row" style="<?php echo $s['maintenance_http_status'] == 301 ? '' : 'display:none;'; ?>">
-                                <th><label for="maintenance_redirect_url">URL de redirección</label></th>
-                                <td><input type="url" name="maintenance_redirect_url" id="maintenance_redirect_url" value="<?php echo esc_attr( $s['maintenance_redirect_url'] ); ?>" class="regular-text" placeholder="https://..."></td>
-                            </tr>
-                        </table>
+                        <div class="co-field-grid">
+                            <label>Código HTTP</label>
+                            <div class="co-pill-select" data-co-pill-group="maintenance_http_status">
+                                <label class="<?php echo 503 == $s['maintenance_http_status'] ? 'on' : ''; ?>"><input type="radio" name="maintenance_http_status" value="503" <?php checked( $s['maintenance_http_status'], 503 ); ?>>503</label>
+                                <label class="<?php echo 200 == $s['maintenance_http_status'] ? 'on' : ''; ?>"><input type="radio" name="maintenance_http_status" value="200" <?php checked( $s['maintenance_http_status'], 200 ); ?>>200</label>
+                                <label class="<?php echo 404 == $s['maintenance_http_status'] ? 'on' : ''; ?>"><input type="radio" name="maintenance_http_status" value="404" <?php checked( $s['maintenance_http_status'], 404 ); ?>>404</label>
+                                <label class="<?php echo 301 == $s['maintenance_http_status'] ? 'on' : ''; ?>"><input type="radio" name="maintenance_http_status" value="301" <?php checked( $s['maintenance_http_status'], 301 ); ?>>301</label>
+                            </div>
+                            <p class="co-field-hint">503 le dice a Google que vuelva más tarde sin des-indexar el sitio. 301 redirige a otra URL.</p>
+                        </div>
+                        <div class="co-field-grid" id="co-redirect-row" style="<?php echo $s['maintenance_http_status'] == 301 ? '' : 'display:none;'; ?>">
+                            <label for="maintenance_redirect_url">URL de redirección</label>
+                            <input type="url" name="maintenance_redirect_url" id="maintenance_redirect_url" value="<?php echo esc_attr( $s['maintenance_redirect_url'] ); ?>" placeholder="https://...">
+                        </div>
                     </div>
 
-                    <div style="background:#fff;border:1px solid #c3c4c7;border-radius:6px;padding:20px 24px;margin-top:16px;">
-                        <h2 style="margin-top:0;border-bottom:1px solid #f0f0f1;padding-bottom:10px;font-size:14px;">🔓 Quién puede ver el sitio</h2>
-                        <table class="form-table">
-                            <tr>
-                                <th style="width:200px;"><label for="maintenance_bypass_role">Rol mínimo</label></th>
-                                <td>
-                                    <select name="maintenance_bypass_role" id="maintenance_bypass_role">
-                                        <option value="administrator" <?php selected( $s['maintenance_bypass_role'], 'administrator' ); ?>>Solo administrador (recomendado)</option>
-                                        <option value="editor" <?php selected( $s['maintenance_bypass_role'], 'editor' ); ?>>Editor o superior</option>
-                                        <option value="author" <?php selected( $s['maintenance_bypass_role'], 'author' ); ?>>Autor o superior</option>
-                                        <option value="contributor" <?php selected( $s['maintenance_bypass_role'], 'contributor' ); ?>>Colaborador o superior</option>
-                                        <option value="subscriber" <?php selected( $s['maintenance_bypass_role'], 'subscriber' ); ?>>Suscriptor o superior</option>
-                                        <option value="" <?php selected( $s['maintenance_bypass_role'], '' ); ?>>Cualquier usuario que haya iniciado sesión</option>
-                                    </select>
-                                    <p class="description">Por defecto solo el administrador logueado ve la web real; el resto de visitantes (incluidos usuarios sin sesión) ven la página de mantenimiento.</p>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th><label for="maintenance_ip_whitelist">IPs permitidas <span style="font-weight:normal;color:#888;">(opcional)</span></label></th>
-                                <td>
-                                    <textarea name="maintenance_ip_whitelist" id="maintenance_ip_whitelist" rows="3" class="large-text" placeholder="Una IP por línea"><?php echo esc_textarea( implode( "\n", (array) $s['maintenance_ip_whitelist'] ) ); ?></textarea>
-                                    <p class="description">Estas IPs ven el sitio normal aunque no hayan iniciado sesión (ej. la oficina de Caracool). Déjalo vacío si no lo necesitas.</p>
-                                </td>
-                            </tr>
-                        </table>
+                    <div class="co-card">
+                        <div class="co-card-head">
+                            <div class="co-card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                            </div>
+                            <h2>Quién puede ver el sitio</h2>
+                        </div>
+                        <div class="co-field-grid">
+                            <label for="maintenance_bypass_role">Rol mínimo</label>
+                            <select name="maintenance_bypass_role" id="maintenance_bypass_role">
+                                <option value="administrator" <?php selected( $s['maintenance_bypass_role'], 'administrator' ); ?>>Solo administrador (recomendado)</option>
+                                <option value="editor" <?php selected( $s['maintenance_bypass_role'], 'editor' ); ?>>Editor o superior</option>
+                                <option value="author" <?php selected( $s['maintenance_bypass_role'], 'author' ); ?>>Autor o superior</option>
+                                <option value="contributor" <?php selected( $s['maintenance_bypass_role'], 'contributor' ); ?>>Colaborador o superior</option>
+                                <option value="subscriber" <?php selected( $s['maintenance_bypass_role'], 'subscriber' ); ?>>Suscriptor o superior</option>
+                                <option value="" <?php selected( $s['maintenance_bypass_role'], '' ); ?>>Cualquier usuario que haya iniciado sesión</option>
+                            </select>
+                            <p class="co-field-hint">Por defecto solo el administrador logueado ve la web real; el resto de visitantes (incluidos usuarios sin sesión) ven la página de mantenimiento.</p>
+
+                            <label for="maintenance_ip_whitelist">IPs permitidas <span style="font-weight:normal;">(opcional)</span></label>
+                            <textarea name="maintenance_ip_whitelist" id="maintenance_ip_whitelist" rows="3" placeholder="Una IP por línea"><?php echo esc_textarea( implode( "\n", (array) $s['maintenance_ip_whitelist'] ) ); ?></textarea>
+                            <p class="co-field-hint">Estas IPs ven el sitio normal aunque no hayan iniciado sesión (ej. la oficina de Caracool). Déjalo vacío si no lo necesitas.</p>
+                        </div>
                     </div>
 
-                    <div style="background:#fff;border:1px solid #c3c4c7;border-radius:6px;padding:20px 24px;margin-top:16px;">
-                        <h2 style="margin-top:0;border-bottom:1px solid #f0f0f1;padding-bottom:10px;font-size:14px;">🎨 Página de mantenimiento</h2>
+                    <div class="co-card">
+                        <div class="co-card-head">
+                            <div class="co-card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+                            </div>
+                            <h2>Página de mantenimiento</h2>
+                        </div>
 
-                        <label>
-                            <input type="checkbox" name="maintenance_use_custom_html" id="maintenance_use_custom_html" value="1" <?php checked( $s['maintenance_use_custom_html'] ); ?>>
-                            Usar HTML personalizado en lugar de la plantilla por defecto
-                        </label>
+                        <div class="co-toggle-row" style="padding-top:12px;">
+                            <div>
+                                <div class="co-label">Usar HTML personalizado</div>
+                                <p class="co-hint">En lugar de la plantilla por defecto (logo, colores y texto de abajo).</p>
+                            </div>
+                            <label class="co-switch">
+                                <input type="checkbox" name="maintenance_use_custom_html" id="maintenance_use_custom_html" value="1" <?php checked( $s['maintenance_use_custom_html'] ); ?>>
+                                <span class="co-track"></span>
+                            </label>
+                        </div>
 
-                        <div id="co-default-page-fields" style="<?php echo $s['maintenance_use_custom_html'] ? 'display:none;' : ''; ?>margin-top:14px;">
-                            <table class="form-table" style="margin-top:0;">
-                                <tr>
-                                    <th style="width:200px;"><label for="maintenance_title">Título de la pestaña</label></th>
-                                    <td><input type="text" name="maintenance_title" id="maintenance_title" value="<?php echo esc_attr( $s['maintenance_title'] ); ?>" class="regular-text" placeholder="<?php echo esc_attr( get_bloginfo( 'name' ) ); ?>"></td>
-                                </tr>
-                                <tr>
-                                    <th><label for="maintenance_heading">Titular</label></th>
-                                    <td><input type="text" name="maintenance_heading" id="maintenance_heading" value="<?php echo esc_attr( $s['maintenance_heading'] ); ?>" class="regular-text" placeholder="Estamos preparando algo nuevo"></td>
-                                </tr>
-                                <tr>
-                                    <th><label for="maintenance_message">Mensaje</label></th>
-                                    <td><textarea name="maintenance_message" id="maintenance_message" rows="3" class="large-text" placeholder="Volvemos enseguida. Gracias por tu paciencia."><?php echo esc_textarea( $s['maintenance_message'] ); ?></textarea></td>
-                                </tr>
-                                <tr>
-                                    <th><label for="maintenance_logo_id">Logo</label></th>
-                                    <td>
-                                        <input type="hidden" name="maintenance_logo_url" id="maintenance_logo_url" value="<?php echo esc_attr( $s['maintenance_logo_url'] ); ?>">
-                                        <button type="button" class="button button-secondary" id="co-select-logo"><?php echo $s['maintenance_logo_url'] ? '🔄 Cambiar logo' : '📁 Seleccionar logo'; ?></button>
-                                        <img id="co-logo-preview" src="<?php echo esc_url( $s['maintenance_logo_url'] ); ?>" style="max-height:48px;vertical-align:middle;margin-left:10px;<?php echo $s['maintenance_logo_url'] ? '' : 'display:none;'; ?>">
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <th><label for="maintenance_bg_color">Color de fondo</label></th>
-                                    <td><input type="text" name="maintenance_bg_color" id="maintenance_bg_color" value="<?php echo esc_attr( $s['maintenance_bg_color'] ); ?>" class="co-color-picker"></td>
-                                </tr>
-                                <tr>
-                                    <th><label for="maintenance_text_color">Color de texto</label></th>
-                                    <td><input type="text" name="maintenance_text_color" id="maintenance_text_color" value="<?php echo esc_attr( $s['maintenance_text_color'] ); ?>" class="co-color-picker"></td>
-                                </tr>
-                                <tr>
-                                    <th><label for="maintenance_show_credit">Crédito Caracool</label></th>
-                                    <td>
-                                        <label><input type="checkbox" name="maintenance_show_credit" value="1" <?php checked( $s['maintenance_show_credit'] ); ?>> Mostrar "Hecho con ❤️ por Caracool" al pie de la página</label>
-                                    </td>
-                                </tr>
-                            </table>
+                        <div id="co-default-page-fields" class="co-field-grid" style="<?php echo $s['maintenance_use_custom_html'] ? 'display:none;' : ''; ?>">
+                            <label for="maintenance_title">Título de la pestaña</label>
+                            <input type="text" name="maintenance_title" id="maintenance_title" value="<?php echo esc_attr( $s['maintenance_title'] ); ?>" placeholder="<?php echo esc_attr( get_bloginfo( 'name' ) ); ?>">
+
+                            <label for="maintenance_heading">Titular</label>
+                            <input type="text" name="maintenance_heading" id="maintenance_heading" value="<?php echo esc_attr( $s['maintenance_heading'] ); ?>" placeholder="Estamos preparando algo nuevo">
+
+                            <label for="maintenance_message">Mensaje</label>
+                            <textarea name="maintenance_message" id="maintenance_message" rows="3" placeholder="Volvemos enseguida. Gracias por tu paciencia."><?php echo esc_textarea( $s['maintenance_message'] ); ?></textarea>
+
+                            <label for="maintenance_logo_id">Logo</label>
+                            <div>
+                                <input type="hidden" name="maintenance_logo_url" id="maintenance_logo_url" value="<?php echo esc_attr( $s['maintenance_logo_url'] ); ?>">
+                                <button type="button" class="co-btn co-btn-ghost" id="co-select-logo" style="padding:7px 14px;font-size:12.5px;"><?php echo $s['maintenance_logo_url'] ? 'Cambiar logo' : 'Seleccionar logo'; ?></button>
+                                <img id="co-logo-preview" src="<?php echo esc_url( $s['maintenance_logo_url'] ); ?>" style="max-height:40px;vertical-align:middle;margin-left:10px;border-radius:6px;<?php echo $s['maintenance_logo_url'] ? '' : 'display:none;'; ?>">
+                            </div>
+
+                            <label for="maintenance_bg_color">Color de fondo</label>
+                            <input type="text" name="maintenance_bg_color" id="maintenance_bg_color" value="<?php echo esc_attr( $s['maintenance_bg_color'] ); ?>" class="co-color-picker">
+
+                            <label for="maintenance_text_color">Color de texto</label>
+                            <input type="text" name="maintenance_text_color" id="maintenance_text_color" value="<?php echo esc_attr( $s['maintenance_text_color'] ); ?>" class="co-color-picker">
+
+                            <label for="maintenance_show_credit">Crédito Caracool</label>
+                            <label style="display:flex;align-items:center;gap:8px;font-weight:400;padding-top:0;">
+                                <input type="checkbox" name="maintenance_show_credit" value="1" <?php checked( $s['maintenance_show_credit'] ); ?> style="width:auto;"> Mostrar "Hecho con ❤️ por Caracool" al pie de la página
+                            </label>
                         </div>
 
                         <div id="co-custom-html-field" style="<?php echo $s['maintenance_use_custom_html'] ? '' : 'display:none;'; ?>margin-top:14px;">
-                            <textarea name="maintenance_custom_html" id="maintenance_custom_html" rows="12" class="large-text" placeholder="&lt;h1&gt;Volvemos pronto&lt;/h1&gt;"><?php echo esc_textarea( $s['maintenance_custom_html'] ); ?></textarea>
-                            <p class="description">HTML completo de la página. Se sanea con las mismas reglas que el contenido de una entrada.</p>
+                            <textarea name="maintenance_custom_html" id="maintenance_custom_html" rows="12" class="code" placeholder="&lt;h1&gt;Volvemos pronto&lt;/h1&gt;"><?php echo esc_textarea( $s['maintenance_custom_html'] ); ?></textarea>
+                            <p class="co-field-hint" style="margin-top:6px;">HTML completo de la página. Se sanea con las mismas reglas que el contenido de una entrada.</p>
                         </div>
                     </div>
 
-                    <?php if ( $s['maintenance_enabled'] ) : ?>
-                    <p><a href="<?php echo esc_url( home_url( '/' ) ); ?>" target="_blank" class="button">👁 Ver página de mantenimiento</a></p>
-                    <?php endif; ?>
+                    <div class="co-btn-row">
+                        <button type="submit" class="co-btn co-btn-primary">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            Guardar configuración
+                        </button>
+                        <a href="<?php echo esc_url( wp_nonce_url( home_url( '/' ), 'co_preview_maintenance', 'co_preview_maintenance' ) ); ?>" target="_blank" class="co-btn co-btn-ghost">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                            Ver página de mantenimiento
+                        </a>
+                        <p class="co-field-hint" style="width:100%;margin-top:8px;">Se abre en una pestaña nueva, mostrando la página tal cual la vería un visitante — aunque tú, como administrador, normalmente la saltarías.</p>
+                    </div>
 
                 </div>
-
-                <p class="submit">
-                    <?php submit_button( '💾 Guardar configuración', 'primary', 'submit', false ); ?>
-                </p>
             </form>
+
+            <!-- ── TAB: CÓDIGO PERSONALIZADO ── -->
+            <!-- Formulario aparte a propósito: la lista de snippets es de
+                 tamaño variable y usa sus propios bloques repetibles. -->
+            <div id="tab-codigo" class="co-tab-panel co-panel <?php echo 'tab-codigo' === $active_tab ? 'active' : ''; ?>">
+                <div class="co-card">
+                    <div class="co-card-head">
+                        <div class="co-card-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                        </div>
+                        <h2>Código personalizado</h2>
+                    </div>
+                    <p class="co-card-desc">
+                        Inserta HTML, CSS o JavaScript (por ejemplo, el código de Google Analytics, Meta Pixel o Google Tag Manager) directamente en el <code>&lt;head&gt;</code> o antes de cerrar el <code>&lt;/body&gt;</code> del sitio, sin tocar el tema.
+                        Un snippet inactivo, o si no hay ninguno guardado, no añade absolutamente nada al sitio — el módulo no engancha nada hasta que hay al menos uno activo.
+                    </p>
+                    <p class="co-card-desc">
+                        El código se pega tal cual, sin filtrar — igual que editar el tema directamente. Solo un administrador puede llegar hasta aquí, así que el riesgo es el mismo que el de cualquier cambio en el tema: revísalo antes de guardar.
+                    </p>
+
+                    <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+                        <?php wp_nonce_field( 'caracool_onestep_save' ); ?>
+                        <input type="hidden" name="action" value="caracool_onestep_save">
+                        <input type="hidden" name="co_form" value="snippets">
+
+                        <div id="co-snippets-list">
+                            <?php
+                            $snippets = (array) $s['snippets'];
+                            if ( ! $snippets ) $snippets = [ [] ]; // al menos un bloque vacío para empezar
+                            foreach ( $snippets as $i => $snippet ) :
+                                $snippet = wp_parse_args( $snippet, [
+                                    'name' => '', 'code' => '', 'location' => 'footer',
+                                    'active' => false, 'visibility' => 'all', 'urls' => [],
+                                ] );
+                                $co_url_count = count( (array) $snippet['urls'] );
+                                ?>
+                                <div class="co-snippet co-snippet-block">
+                                    <div class="co-snippet-top">
+                                        <input type="text" name="snippets[<?php echo (int) $i; ?>][name]" value="<?php echo esc_attr( $snippet['name'] ); ?>" class="co-name-input" placeholder="Ej. Google Analytics">
+                                        <div class="co-snippet-meta">
+                                            <label class="co-switch co-switch-sm" title="Activo">
+                                                <input type="checkbox" class="co-snippet-active" name="snippets[<?php echo (int) $i; ?>][active]" value="1" <?php checked( $snippet['active'] ); ?>>
+                                                <span class="co-track"></span>
+                                            </label>
+                                            <span class="co-badge co-badge-active <?php echo $snippet['active'] ? '' : 'muted'; ?>"><?php echo $snippet['active'] ? 'Activo' : 'Inactivo'; ?></span>
+                                            <span class="co-badge muted"><?php echo 'head' === $snippet['location'] ? 'Head' : 'Footer'; ?></span>
+                                            <span class="co-badge muted">
+                                                <?php
+                                                if ( 'all_except' === $snippet['visibility'] ) echo 'Excluye ' . (int) $co_url_count . ' URL(s)';
+                                                elseif ( 'only' === $snippet['visibility'] ) echo 'Solo ' . (int) $co_url_count . ' URL(s)';
+                                                else echo 'Todo el sitio';
+                                                ?>
+                                            </span>
+                                            <button type="button" class="co-icon-btn co-remove-snippet" title="Quitar este snippet">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code" placeholder="&lt;script&gt;...&lt;/script&gt;" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
+
+                                    <div class="co-snippet-fields">
+                                        <div>
+                                            <label>Ubicación</label>
+                                            <select name="snippets[<?php echo (int) $i; ?>][location]">
+                                                <option value="head" <?php selected( $snippet['location'], 'head' ); ?>>Head (antes de &lt;/head&gt;)</option>
+                                                <option value="footer" <?php selected( $snippet['location'], 'footer' ); ?>>Footer (antes de &lt;/body&gt;)</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label>Dónde se muestra</label>
+                                            <select class="co-snippet-visibility" name="snippets[<?php echo (int) $i; ?>][visibility]">
+                                                <option value="all" <?php selected( $snippet['visibility'], 'all' ); ?>>Todo el sitio</option>
+                                                <option value="all_except" <?php selected( $snippet['visibility'], 'all_except' ); ?>>Todo el sitio, excepto estas URLs</option>
+                                                <option value="only" <?php selected( $snippet['visibility'], 'only' ); ?>>Solo estas URLs</option>
+                                            </select>
+                                        </div>
+                                        <div class="co-full co-snippet-urls-row" style="<?php echo 'all' === $snippet['visibility'] ? 'display:none;' : ''; ?>">
+                                            <label>URLs (una por línea)</label>
+                                            <textarea name="snippets[<?php echo (int) $i; ?>][urls]" rows="2" placeholder="/contacto/&#10;/blog/*"><?php echo esc_textarea( implode( "\n", (array) $snippet['urls'] ) ); ?></textarea>
+                                            <p class="co-field-hint" style="margin-top:4px;">Ruta exacta (<code>/contacto/</code>) o con <code>*</code> al final para un grupo (<code>/blog/*</code>).</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+
+                        <div class="co-btn-row">
+                            <button type="button" class="co-btn co-btn-ghost" id="co-add-snippet">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                Añadir snippet
+                            </button>
+                        </div>
+
+                        <div class="co-btn-row">
+                            <button type="submit" class="co-btn co-btn-primary">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                Guardar código personalizado
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <p class="co-foot-credit">Hecho por Caracool</p>
         </div>
+
+        <template id="co-snippet-template">
+            <div class="co-snippet co-snippet-block">
+                <div class="co-snippet-top">
+                    <input type="text" name="snippets[__I__][name]" value="" class="co-name-input" placeholder="Ej. Google Analytics">
+                    <div class="co-snippet-meta">
+                        <label class="co-switch co-switch-sm" title="Activo">
+                            <input type="checkbox" class="co-snippet-active" name="snippets[__I__][active]" value="1">
+                            <span class="co-track"></span>
+                        </label>
+                        <span class="co-badge co-badge-active muted">Inactivo</span>
+                        <span class="co-badge muted">Footer</span>
+                        <span class="co-badge muted">Todo el sitio</span>
+                        <button type="button" class="co-icon-btn co-remove-snippet" title="Quitar este snippet">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                        </button>
+                    </div>
+                </div>
+
+                <textarea name="snippets[__I__][code]" rows="5" class="code" placeholder="&lt;script&gt;...&lt;/script&gt;" style="margin-top:12px;"></textarea>
+
+                <div class="co-snippet-fields">
+                    <div>
+                        <label>Ubicación</label>
+                        <select name="snippets[__I__][location]">
+                            <option value="head">Head (antes de &lt;/head&gt;)</option>
+                            <option value="footer" selected>Footer (antes de &lt;/body&gt;)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>Dónde se muestra</label>
+                        <select class="co-snippet-visibility" name="snippets[__I__][visibility]">
+                            <option value="all" selected>Todo el sitio</option>
+                            <option value="all_except">Todo el sitio, excepto estas URLs</option>
+                            <option value="only">Solo estas URLs</option>
+                        </select>
+                    </div>
+                    <div class="co-full co-snippet-urls-row" style="display:none;">
+                        <label>URLs (una por línea)</label>
+                        <textarea name="snippets[__I__][urls]" rows="2" placeholder="/contacto/&#10;/blog/*"></textarea>
+                        <p class="co-field-hint" style="margin-top:4px;">Ruta exacta (<code>/contacto/</code>) o con <code>*</code> al final para un grupo (<code>/blog/*</code>).</p>
+                    </div>
+                </div>
+            </div>
+        </template>
 
         <script>
         (function () {
             // ── Tabs (vanilla JS, sin dependencias) ────────────
-            var tabs   = document.querySelectorAll('.nav-tab-wrapper .nav-tab');
-            var panels = document.querySelectorAll('.co-tab-panel');
+            var tabs        = document.querySelectorAll('.co-tab');
+            var panels      = document.querySelectorAll('.co-panel');
+            var activeInput = document.getElementById('co-active-tab-input');
             tabs.forEach(function (tab) {
-                tab.addEventListener('click', function (e) {
-                    e.preventDefault();
-                    tabs.forEach(function (t) { t.classList.remove('nav-tab-active'); });
-                    panels.forEach(function (p) { p.style.display = 'none'; });
-                    tab.classList.add('nav-tab-active');
-                    document.getElementById(tab.dataset.coTab).style.display = '';
+                tab.addEventListener('click', function () {
+                    tabs.forEach(function (t) { t.classList.remove('active'); });
+                    panels.forEach(function (p) { p.classList.remove('active'); });
+                    tab.classList.add('active');
+                    document.getElementById(tab.dataset.coTab).classList.add('active');
+                    // Recuerda la pestaña en el campo oculto del formulario
+                    // principal, para volver aquí tras guardar (solo aplica
+                    // a Comentarios/Mantenimiento, que comparten ese <form>).
+                    if (activeInput && tab.dataset.coTab !== 'tab-codigo') {
+                        activeInput.value = tab.dataset.coTab;
+                    }
                 });
             });
 
-            // ── Mostrar/ocultar campo de redirección ───────────
-            var statusSelect = document.getElementById('maintenance_http_status');
-            var redirectRow  = document.getElementById('co-redirect-row');
-            if (statusSelect) {
-                statusSelect.addEventListener('change', function () {
-                    redirectRow.style.display = (this.value === '301') ? '' : 'none';
+            // ── Grupos de pill-select (radios) ──────────────────
+            document.querySelectorAll('.co-pill-select').forEach(function (group) {
+                var labels = group.querySelectorAll('label');
+                group.querySelectorAll('input[type=radio]').forEach(function (input) {
+                    input.addEventListener('change', function () {
+                        labels.forEach(function (l) { l.classList.remove('on'); });
+                        input.closest('label').classList.add('on');
+                        if (group.dataset.coPillGroup === 'maintenance_http_status') {
+                            var redirectRow = document.getElementById('co-redirect-row');
+                            if (redirectRow) redirectRow.style.display = (input.value === '301') ? '' : 'none';
+                        }
+                    });
                 });
-            }
+            });
 
             // ── HTML personalizado vs plantilla por defecto ────
             var customToggle = document.getElementById('maintenance_use_custom_html');
@@ -349,6 +711,57 @@ class Caracool_OneStep {
                 customToggle.addEventListener('change', function () {
                     defaultFields.style.display = this.checked ? 'none' : '';
                     customField.style.display   = this.checked ? '' : 'none';
+                });
+            }
+
+            // ── Código personalizado: mostrar/ocultar el textarea de URLs
+            // según la visibilidad elegida, badge de activo/inactivo, y
+            // bloques de snippet repetibles ──
+            function coBindSnippetBlock(block) {
+                var visSelect = block.querySelector('.co-snippet-visibility');
+                var urlsRow   = block.querySelector('.co-snippet-urls-row');
+                if (visSelect && urlsRow) {
+                    visSelect.addEventListener('change', function () {
+                        urlsRow.style.display = (this.value === 'all') ? 'none' : '';
+                    });
+                }
+                var activeInput = block.querySelector('.co-snippet-active');
+                var activeBadge = block.querySelector('.co-badge-active');
+                if (activeInput && activeBadge) {
+                    activeInput.addEventListener('change', function () {
+                        activeBadge.textContent = this.checked ? 'Activo' : 'Inactivo';
+                        activeBadge.classList.toggle('muted', ! this.checked);
+                    });
+                }
+                var removeBtn = block.querySelector('.co-remove-snippet');
+                if (removeBtn) {
+                    removeBtn.addEventListener('click', function () {
+                        var list = document.getElementById('co-snippets-list');
+                        // Deja siempre al menos un bloque, para que el usuario no
+                        // se quede sin ningún campo donde escribir.
+                        if (list.querySelectorAll('.co-snippet-block').length > 1) {
+                            block.remove();
+                        } else {
+                            block.querySelectorAll('input[type=text], textarea').forEach(function (f) { f.value = ''; });
+                            block.querySelectorAll('input[type=checkbox]').forEach(function (f) { f.checked = false; });
+                        }
+                    });
+                }
+            }
+            document.querySelectorAll('#co-snippets-list .co-snippet-block').forEach(coBindSnippetBlock);
+
+            var addSnippetBtn = document.getElementById('co-add-snippet');
+            var snippetTemplate = document.getElementById('co-snippet-template');
+            if (addSnippetBtn && snippetTemplate) {
+                addSnippetBtn.addEventListener('click', function () {
+                    var list = document.getElementById('co-snippets-list');
+                    var idx  = list.querySelectorAll('.co-snippet-block').length;
+                    var html = snippetTemplate.innerHTML.split('__I__').join(idx);
+                    var wrapper = document.createElement('div');
+                    wrapper.innerHTML = html.trim();
+                    var block = wrapper.firstElementChild;
+                    list.appendChild(block);
+                    coBindSnippetBlock(block);
                 });
             }
         })();
@@ -369,7 +782,7 @@ class Caracool_OneStep {
                     var att = uploader.state().get('selection').first().toJSON();
                     $('#maintenance_logo_url').val(att.url);
                     $('#co-logo-preview').attr('src', att.url).show();
-                    $('#co-select-logo').text('🔄 Cambiar logo');
+                    $('#co-select-logo').text('Cambiar logo');
                 });
                 uploader.open();
             });
@@ -483,6 +896,20 @@ class Caracool_OneStep {
     // ─────────────────────────────────────────────────────────
     public function maintenance_maybe_render() {
         $s = $this->get_settings();
+
+        // Vista previa: el botón "Ver página de mantenimiento" del admin
+        // añade este nonce a la URL para forzar la página de mantenimiento
+        // aunque el administrador normalmente la saltaría — así se puede
+        // comprobar cómo queda (logo, colores, texto) sin cerrar sesión.
+        if (
+            isset( $_GET['co_preview_maintenance'] )
+            && current_user_can( 'manage_options' )
+            && wp_verify_nonce( wp_unslash( $_GET['co_preview_maintenance'] ), 'co_preview_maintenance' )
+        ) {
+            $this->maintenance_render_page( $s );
+            exit;
+        }
+
         if ( empty( $s['maintenance_enabled'] ) ) return;
         if ( is_admin() ) return; // wp-admin siempre accesible, para poder desactivarlo
 
@@ -600,9 +1027,103 @@ class Caracool_OneStep {
 </html>
         <?php
     }
+
+    // ─────────────────────────────────────────────────────────
+    // MÓDULO: CÓDIGO PERSONALIZADO
+    // Inserta snippets guardados por el admin en el head o el footer.
+    // Coste cero si no hay ningún snippet activo: no se engancha nada en
+    // wp_head/wp_footer a menos que exista al menos uno. El código se
+    // imprime tal cual (sin wp_kses_post ni similar) porque, igual que con
+    // el HTML personalizado de mantenimiento, filtrarlo rompería el propio
+    // propósito del módulo (scripts de analítica, pixels, etc. no son HTML
+    // "de contenido"). Solo un administrador (manage_options) puede llegar
+    // hasta aquí, así que el nivel de confianza es el mismo que editar el
+    // tema directamente — no se expone a roles inferiores.
+    // ─────────────────────────────────────────────────────────
+    private $active_snippets = [];
+
+    private function snippets_bootstrap( $settings ) {
+        $snippets = is_array( $settings['snippets'] ?? null ) ? $settings['snippets'] : [];
+
+        $active = array_values( array_filter( $snippets, function ( $snippet ) {
+            return ! empty( $snippet['active'] ) && '' !== trim( $snippet['code'] ?? '' );
+        } ) );
+
+        if ( ! $active ) return; // nada activo → no se engancha nada, coste cero
+
+        $this->active_snippets = $active;
+
+        add_action( 'wp_head', [ $this, 'snippets_print_head' ], 999 );
+        add_action( 'wp_footer', [ $this, 'snippets_print_footer' ], 999 );
+    }
+
+    public function snippets_print_head() {
+        $this->snippets_print_for_location( 'head' );
+    }
+
+    public function snippets_print_footer() {
+        $this->snippets_print_for_location( 'footer' );
+    }
+
+    private function snippets_print_for_location( $location ) {
+        foreach ( $this->active_snippets as $snippet ) {
+            if ( ( $snippet['location'] ?? 'footer' ) !== $location ) continue;
+            if ( ! $this->snippet_applies_to_current_url( $snippet ) ) continue;
+
+            $label = $snippet['name'] ? $snippet['name'] : 'sin nombre';
+            echo "\n<!-- Caracool OneStep · " . esc_html( $label ) . " -->\n" . $snippet['code'] . "\n";
+        }
+    }
+
+    private function snippet_applies_to_current_url( $snippet ) {
+        $visibility = $snippet['visibility'] ?? 'all';
+        if ( 'all' === $visibility ) return true;
+
+        $matches = $this->snippet_url_matches( (array) ( $snippet['urls'] ?? [] ) );
+
+        if ( 'only' === $visibility ) return $matches;
+        if ( 'all_except' === $visibility ) return ! $matches;
+        return true;
+    }
+
+    /**
+     * Compara la URL actual contra una lista de rutas. Cada patrón puede ser
+     * una ruta exacta ("/contacto/") o terminar en "*" para un grupo entero
+     * ("/blog/*"). Comparación simple a propósito — es lo que cubre el caso
+     * de uso real (excluir o limitar a un puñado de páginas conocidas), no
+     * pretende ser un sistema de reglas de condición avanzado.
+     */
+    private function snippet_url_matches( $patterns ) {
+        $request_path = wp_parse_url( $_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH );
+        $path = untrailingslashit( $request_path ?: '/' );
+        if ( '' === $path ) $path = '/';
+
+        foreach ( $patterns as $pattern ) {
+            $pattern = trim( $pattern );
+            if ( '' === $pattern ) continue;
+
+            if ( '*' === substr( $pattern, -1 ) ) {
+                $prefix = untrailingslashit( substr( $pattern, 0, -1 ) );
+                if ( '' === $prefix || 0 === strpos( $path, $prefix ) ) return true;
+            } elseif ( untrailingslashit( $pattern ) === $path ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 new Caracool_OneStep();
+
+// ── Enlace "Ajustes" en la lista de Plugins ────────────────────
+// Aparece junto a Activar/Desactivar/Borrar, y lleva directo a la página
+// de ajustes de OneStep en vez de tener que buscarla en el menú lateral.
+add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), function ( $links ) {
+    $settings_link = '<a href="' . esc_url( admin_url( 'admin.php?page=' . CARACOOL_ONESTEP_SLUG ) ) . '">Ajustes</a>';
+    array_unshift( $links, $settings_link );
+    return $links;
+} );
 
 // ── Update checker — GitHub Releases ──────────────────────────
 // Comprueba si hay nueva versión disponible en el repo público,
@@ -683,8 +1204,8 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'tested'       => '6.8',
         'requires_php' => '7.4',
         'sections'     => [
-            'description' => 'Desactiva comentarios en todo el sitio y activa un modo de mantenimiento con página personalizable, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable e inserta código personalizado (HTML/CSS/JS) en el head o el footer, en un único plugin ligero, sin dependencias externas.',
+            'changelog'   => '<h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
