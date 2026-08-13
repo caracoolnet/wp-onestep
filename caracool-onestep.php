@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
- * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable e inserta código personalizado en el head/footer. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.1.0
+ * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
+ * Version:     1.2.0
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.1.0' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.2.0' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -53,6 +53,10 @@ class Caracool_OneStep {
         add_action( 'template_redirect', [ $this, 'maintenance_maybe_render' ], 0 );
 
         $this->snippets_bootstrap( $settings );
+
+        if ( ! empty( $settings['duplicate_enabled'] ) ) {
+            $this->duplicate_bootstrap();
+        }
     }
 
     // ── Ajustes por defecto ───────────────────────────────────
@@ -79,6 +83,10 @@ class Caracool_OneStep {
 
             // Código personalizado (snippets de head/footer)
             'snippets' => [],
+
+            // Duplicar (páginas y entradas)
+            'duplicate_enabled'      => false,
+            'duplicate_title_prefix' => 'Copia de ',
         ] );
     }
 
@@ -131,6 +139,9 @@ class Caracool_OneStep {
                 'maintenance_bypass_role'     => $bypass_role,
                 'maintenance_ip_whitelist'    => $ip_list,
                 'maintenance_show_credit'     => ! empty( $_POST['maintenance_show_credit'] ),
+
+                'duplicate_enabled'           => ! empty( $_POST['duplicate_enabled'] ),
+                'duplicate_title_prefix'      => sanitize_text_field( wp_unslash( $_POST['duplicate_title_prefix'] ?? '' ) ),
             ];
         }
 
@@ -143,7 +154,7 @@ class Caracool_OneStep {
             $active_tab = 'tab-codigo';
         } else {
             $posted_tab = sanitize_key( wp_unslash( $_POST['co_active_tab'] ?? '' ) );
-            $active_tab = in_array( $posted_tab, [ 'tab-comentarios', 'tab-mantenimiento' ], true ) ? $posted_tab : 'tab-comentarios';
+            $active_tab = in_array( $posted_tab, [ 'tab-comentarios', 'tab-mantenimiento', 'tab-duplicar' ], true ) ? $posted_tab : 'tab-comentarios';
         }
 
         wp_safe_redirect( admin_url( 'admin.php?page=' . CARACOOL_ONESTEP_SLUG . '&saved=1&tab=' . $active_tab ) );
@@ -223,9 +234,9 @@ class Caracool_OneStep {
 
         // Qué pestaña mostrar activa al cargar: la que venga en la URL tras
         // guardar (ver save_settings()), o "Comentarios" por defecto.
-        $co_valid_tabs = [ 'tab-comentarios', 'tab-mantenimiento', 'tab-codigo' ];
+        $co_valid_tabs = [ 'tab-comentarios', 'tab-mantenimiento', 'tab-codigo', 'tab-duplicar' ];
         $active_tab    = isset( $_GET['tab'] ) && in_array( $_GET['tab'], $co_valid_tabs, true ) ? sanitize_key( $_GET['tab'] ) : 'tab-comentarios';
-        $co_main_tab   = 'tab-mantenimiento' === $active_tab ? 'tab-mantenimiento' : 'tab-comentarios'; // valor inicial del campo oculto del form principal
+        $co_main_tab   = in_array( $active_tab, [ 'tab-mantenimiento', 'tab-duplicar' ], true ) ? $active_tab : 'tab-comentarios'; // valor inicial del campo oculto del form principal
         ?>
         <div class="wrap co-wrap">
         <style>
@@ -347,6 +358,10 @@ class Caracool_OneStep {
             <button type="button" class="co-tab <?php echo 'tab-codigo' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-codigo">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 Código
+            </button>
+            <button type="button" class="co-tab <?php echo 'tab-duplicar' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-duplicar">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Duplicar
             </button>
         </div>
 
@@ -514,6 +529,45 @@ class Caracool_OneStep {
                     </div>
 
                 </div>
+
+                <!-- ── TAB: DUPLICAR ── -->
+                <div id="tab-duplicar" class="co-tab-panel co-panel <?php echo 'tab-duplicar' === $active_tab ? 'active' : ''; ?>">
+                    <div class="co-card">
+                        <div class="co-card-head">
+                            <div class="co-card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <h2>Duplicar</h2>
+                        </div>
+                        <div class="co-toggle-row">
+                            <div>
+                                <div class="co-label">Añadir enlace "Duplicar" a páginas y entradas</div>
+                                <p class="co-hint">Aparece junto a Editar/Papelera en el listado de Páginas y Entradas. Crea una copia como borrador (título, contenido, extracto, imagen destacada, plantilla, taxonomías y campos personalizados) y te lleva directamente a editarla. No copia adjuntos, hijos ni comentarios, y no incluye la función de "republicar programado" — solo duplicar y editar.</p>
+                            </div>
+                            <label class="co-switch">
+                                <input type="checkbox" name="duplicate_enabled" value="1" <?php checked( $s['duplicate_enabled'] ); ?>>
+                                <span class="co-track"></span>
+                            </label>
+                        </div>
+
+                        <div class="co-field-grid">
+                            <label for="duplicate_title_prefix">Prefijo del título</label>
+                            <input type="text" name="duplicate_title_prefix" id="duplicate_title_prefix" value="<?php echo esc_attr( $s['duplicate_title_prefix'] ); ?>" placeholder="Copia de ">
+                            <p class="co-field-hint">Se añade delante del título original en la copia. Déjalo vacío para no añadir nada.</p>
+                        </div>
+
+                        <?php if ( defined( 'ICL_SITEPRESS_VERSION' ) ) : ?>
+                        <p class="co-field-hint" style="margin-top:16px;">WPML detectado: la copia se etiqueta con el mismo idioma que el original, para que no aparezca en el idioma por defecto del sitio por error. No se duplican las demás traducciones — solo el idioma que estás viendo.</p>
+                        <?php endif; ?>
+                    </div>
+
+                    <div class="co-btn-row">
+                        <button type="submit" class="co-btn co-btn-primary">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            Guardar configuración
+                        </button>
+                    </div>
+                </div>
             </form>
 
             <!-- ── TAB: CÓDIGO PERSONALIZADO ── -->
@@ -619,7 +673,7 @@ class Caracool_OneStep {
                 </div>
             </div>
 
-            <p class="co-foot-credit">Hecho por Caracool</p>
+            <p class="co-foot-credit">Hecho con ❤️ por Caracool</p>
         </div>
 
         <template id="co-snippet-template">
@@ -1112,6 +1166,157 @@ class Caracool_OneStep {
 
         return false;
     }
+
+    // ─────────────────────────────────────────────────────────
+    // MÓDULO: DUPLICAR
+    // Un enlace "Duplicar" en el listado de Páginas y Entradas: crea una
+    // copia en borrador y lleva directamente a editarla. Deliberadamente
+    // simple — sin "republicar programado", sin copiar adjuntos/hijos/
+    // comentarios, sin capability propia (usa el mismo edit_post de
+    // siempre). Coste cero si el interruptor está desactivado.
+    // ─────────────────────────────────────────────────────────
+    const DUPLICATE_POST_TYPES = [ 'post', 'page' ];
+
+    private function duplicate_bootstrap() {
+        add_filter( 'post_row_actions', [ $this, 'duplicate_add_row_action' ], 10, 2 );
+        add_filter( 'page_row_actions', [ $this, 'duplicate_add_row_action' ], 10, 2 );
+        add_action( 'admin_action_caracool_onestep_duplicate', [ $this, 'duplicate_handle_action' ] );
+    }
+
+    public function duplicate_add_row_action( $actions, $post ) {
+        if ( ! $post instanceof WP_Post ) return $actions;
+        if ( ! in_array( $post->post_type, self::DUPLICATE_POST_TYPES, true ) ) return $actions;
+        if ( ! current_user_can( 'edit_post', $post->ID ) ) return $actions;
+
+        $url = wp_nonce_url(
+            admin_url( 'admin.php?action=caracool_onestep_duplicate&post=' . $post->ID ),
+            'caracool_onestep_duplicate_' . $post->ID
+        );
+
+        $actions['co_duplicate'] = '<a href="' . esc_url( $url ) . '">Duplicar</a>';
+
+        return $actions;
+    }
+
+    public function duplicate_handle_action() {
+        $post_id = isset( $_GET['post'] ) ? absint( $_GET['post'] ) : 0;
+        if ( ! $post_id ) wp_die( 'Falta el contenido a duplicar.' );
+
+        check_admin_referer( 'caracool_onestep_duplicate_' . $post_id );
+
+        if ( ! current_user_can( 'edit_post', $post_id ) ) wp_die( 'No autorizado.' );
+
+        $original = get_post( $post_id );
+        if ( ! $original || ! in_array( $original->post_type, self::DUPLICATE_POST_TYPES, true ) ) {
+            wp_die( 'Contenido no válido para duplicar.' );
+        }
+
+        $new_id = $this->duplicate_create_copy( $original );
+        if ( is_wp_error( $new_id ) ) {
+            wp_die( esc_html( $new_id->get_error_message() ) );
+        }
+
+        wp_safe_redirect( admin_url( 'post.php?action=edit&post=' . $new_id ) );
+        exit;
+    }
+
+    /**
+     * Crea la copia: título (con prefijo), contenido, extracto, imagen
+     * destacada, plantilla de página, taxonomías y post meta (salvo un
+     * puñado de claves internas de WordPress que no tiene sentido
+     * arrastrar). No copia adjuntos físicos, hijos ni comentarios — a
+     * propósito, no es el caso de uso real de la agencia.
+     */
+    private function duplicate_create_copy( $original ) {
+        $s      = $this->get_settings();
+        $prefix = $s['duplicate_title_prefix'];
+
+        // sanitize_text_field() recorta los espacios al guardar el ajuste,
+        // así que "Copia de " se queda en "Copia de " -> "Copia de" y el
+        // título resultante pegaría las dos palabras ("Copia deEjemplo").
+        // Nos aseguramos aquí de que siempre haya exactamente un espacio
+        // entre el prefijo y el título, sin depender de cómo se guardó.
+        if ( '' !== $prefix && ' ' !== substr( $prefix, -1 ) ) {
+            $prefix .= ' ';
+        }
+
+        $new_id = wp_insert_post( [
+            'post_title'     => $prefix . $original->post_title,
+            'post_content'   => $original->post_content,
+            'post_excerpt'   => $original->post_excerpt,
+            'post_status'    => 'draft',
+            'post_type'      => $original->post_type,
+            'post_parent'    => $original->post_parent,
+            'menu_order'     => $original->menu_order,
+            'post_author'    => $original->post_author,
+            'comment_status' => $original->comment_status,
+            'ping_status'    => $original->ping_status,
+        ], true );
+
+        if ( is_wp_error( $new_id ) ) return $new_id;
+
+        // Imagen destacada y plantilla de página.
+        $thumbnail_id = get_post_thumbnail_id( $original->ID );
+        if ( $thumbnail_id ) set_post_thumbnail( $new_id, $thumbnail_id );
+
+        $template = get_post_meta( $original->ID, '_wp_page_template', true );
+        if ( $template ) update_post_meta( $new_id, '_wp_page_template', $template );
+
+        // Taxonomías propias del tipo de contenido (categorías, etiquetas...).
+        foreach ( get_object_taxonomies( $original->post_type ) as $taxonomy ) {
+            $terms = wp_get_object_terms( $original->ID, $taxonomy, [ 'fields' => 'ids' ] );
+            if ( ! is_wp_error( $terms ) && $terms ) {
+                wp_set_object_terms( $new_id, $terms, $taxonomy );
+            }
+        }
+
+        // Post meta, salvo claves internas ya gestionadas arriba o que no
+        // tiene sentido copiar (bloqueo de edición, slug antiguo...).
+        $skip_meta = [ '_edit_lock', '_edit_last', '_wp_old_slug', '_wp_page_template', '_thumbnail_id' ];
+        foreach ( get_post_meta( $original->ID ) as $key => $values ) {
+            if ( in_array( $key, $skip_meta, true ) ) continue;
+            foreach ( (array) $values as $value ) {
+                add_post_meta( $new_id, $key, maybe_unserialize( $value ) );
+            }
+        }
+
+        update_post_meta( $new_id, '_caracool_onestep_duplicate_of', $original->ID );
+
+        $this->duplicate_wpml_tag_language( $new_id, $original->ID, $original->post_type );
+
+        return $new_id;
+    }
+
+    /**
+     * Si WPML está activo, etiqueta la copia con el mismo idioma que el
+     * original — para que no aparezca en el idioma por defecto del sitio
+     * por error. Deliberadamente NO duplica las demás traducciones (eso
+     * es mucho más código y no es el caso de uso real de la agencia): la
+     * copia queda como una entrada nueva e independiente, en el mismo
+     * idioma que el original, sin formar parte de su grupo de traducción.
+     * Usa la API pública documentada de WPML (filtro/acción), no accede a
+     * sus internals — coste cero si WPML no está activo.
+     */
+    private function duplicate_wpml_tag_language( $new_id, $original_id, $post_type ) {
+        if ( ! defined( 'ICL_SITEPRESS_VERSION' ) ) return;
+
+        $element_type = 'post_' . $post_type;
+
+        $original_lang = apply_filters( 'wpml_element_language_details', null, [
+            'element_id'   => $original_id,
+            'element_type' => $element_type,
+        ] );
+
+        if ( ! $original_lang || empty( $original_lang->language_code ) ) return;
+
+        do_action( 'wpml_set_element_language_details', [
+            'element_id'           => $new_id,
+            'element_type'         => $element_type,
+            'trid'                 => null, // grupo de traducción propio, no el del original
+            'language_code'        => $original_lang->language_code,
+            'source_language_code' => null,
+        ] );
+    }
 }
 
 new Caracool_OneStep();
@@ -1204,8 +1409,8 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'tested'       => '6.8',
         'requires_php' => '7.4',
         'sections'     => [
-            'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable e inserta código personalizado (HTML/CSS/JS) en el head o el footer, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
+            'changelog'   => '<h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
