@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.3.3
+ * Version:     1.3.4
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.3.3' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.3.4' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1499,13 +1499,43 @@ class Caracool_OneStep {
         // a mano. Sin esta clave, Elementor genera su propio CSS la primera
         // vez que se abre o se visita la copia, como con cualquier página
         // nueva.
-        $skip_meta = [ '_edit_lock', '_edit_last', '_wp_old_slug', '_wp_page_template', '_thumbnail_id', '_elementor_css' ];
-        foreach ( get_post_meta( $original->ID ) as $key => $values ) {
-            if ( in_array( $key, $skip_meta, true ) ) continue;
-            foreach ( (array) $values as $value ) {
-                add_post_meta( $new_id, $key, maybe_unserialize( $value ) );
-            }
+        //
+        // Copiamos el post meta LEYENDO Y ESCRIBIENDO DIRECTAMENTE en la
+        // tabla de la base de datos, en vez de con get_post_meta()/
+        // add_post_meta(). Caso real detectado en molinadetapas.es: el
+        // _elementor_data de una página de Elementor (la estructura interna
+        // de secciones/columnas/widgets que usa Elementor) medía 49790
+        // caracteres en la base de datos, pero get_post_meta() devolvía una
+        // versión recortada a 49087 caracteres — casi con toda seguridad
+        // por algún filtro de terceros de este hosting que toca las
+        // lecturas de metadatos grandes a través de la API de WordPress
+        // (el mismo tipo de "hardening" ya mencionado más arriba para el
+        // contenido). Esa versión recortada es la que se copiaba a la
+        // duplicada, dejando el JSON incompleto — Elementor no podía
+        // interpretarlo y mostraba todo el contenido como un único bloque
+        // de texto de repuesto. Leyendo y escribiendo el valor tal cual
+        // está en la tabla, sin pasar por esa API, evitamos que cualquier
+        // filtro de este tipo toque el contenido por el camino.
+        global $wpdb;
+        $skip_meta   = [ '_edit_lock', '_edit_last', '_wp_old_slug', '_wp_page_template', '_thumbnail_id', '_elementor_css' ];
+        $meta_rows   = $wpdb->get_results( $wpdb->prepare(
+            "SELECT meta_key, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d",
+            $original->ID
+        ) );
+        foreach ( $meta_rows as $meta_row ) {
+            if ( in_array( $meta_row->meta_key, $skip_meta, true ) ) continue;
+            $wpdb->insert( $wpdb->postmeta, [
+                'post_id'    => $new_id,
+                'meta_key'   => $meta_row->meta_key,
+                'meta_value' => $meta_row->meta_value,
+            ] );
         }
+        // Como hemos escrito directamente en la tabla (sin pasar por
+        // add_post_meta()), hay que invalidar la caché de metadatos de la
+        // copia a mano — si no, una lectura posterior en esta misma carga
+        // (por ejemplo, el aviso de Elementor al redirigir tras duplicar)
+        // podría no ver todavía lo que acabamos de insertar.
+        wp_cache_delete( $new_id, 'post_meta' );
 
         update_post_meta( $new_id, '_caracool_onestep_duplicate_of', $original->ID );
 
@@ -1637,7 +1667,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'requires_php' => '7.4',
         'sections'     => [
             'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'changelog'   => '<h4>1.3.4</h4><p><strong>Corrección:</strong> el módulo Duplicar seguía sin funcionar bien en páginas de Elementor en algunos hostings: la copia se abría en el editor de Elementor pero con todo el contenido metido en un único bloque de texto, como si Elementor no reconociera su estructura interna. Causa real: al copiar los metadatos de la página, WordPress devolvía una versión recortada de la estructura interna de Elementor (probablemente por algún filtro o caché de terceros propio de ese hosting), y esa versión incompleta era la que se guardaba en la copia. Ahora esos metadatos se copian leyendo y escribiendo directamente en la base de datos, evitando cualquier filtro que pueda alterarlos por el camino. Si duplicar páginas de Elementor te seguía dando problemas tras la 1.3.1, esta versión lo soluciona.</p><h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
