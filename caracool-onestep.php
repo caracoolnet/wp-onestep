@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.3.0
+ * Version:     1.3.1
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.3.0' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.3.1' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1402,7 +1402,23 @@ class Caracool_OneStep {
             wp_die( esc_html( $new_id->get_error_message() ) );
         }
 
-        wp_safe_redirect( admin_url( 'post.php?action=edit&post=' . $new_id ) );
+        // Si la página original se edita con Elementor ('_elementor_edit_mode'
+        // = 'builder'), hay que llevar a la copia al editor de Elementor
+        // (post.php?...&action=elementor), no al editor de bloques de
+        // WordPress. Si se abre una página de Elementor en el editor de
+        // bloques, WordPress no reconoce ninguna de las marcas de Gutenberg
+        // en el HTML (Elementor no las usa) y mete todo el contenido en un
+        // único bloque de texto/HTML clásico — el contenido en sí está
+        // bien, pero se ve y se edita mal. Con esta comprobación la copia
+        // se abre igual que se abriría el original, con sus secciones,
+        // columnas y contenedores intactos. Coste cero si Elementor no está
+        // instalado o la página no se hizo con él (get_post_meta devuelve
+        // una cadena vacía y se usa el editor normal, como hasta ahora).
+        if ( 'builder' === get_post_meta( $new_id, '_elementor_edit_mode', true ) ) {
+            wp_safe_redirect( admin_url( 'post.php?post=' . $new_id . '&action=elementor' ) );
+        } else {
+            wp_safe_redirect( admin_url( 'post.php?action=edit&post=' . $new_id ) );
+        }
         exit;
     }
 
@@ -1426,6 +1442,20 @@ class Caracool_OneStep {
             $prefix .= ' ';
         }
 
+        // El contenido que vamos a copiar ya estaba guardado tal cual en el
+        // original — no es entrada de un formulario que haya que sanear de
+        // nuevo. Si dejamos que wp_insert_post() lo pase otra vez por KSES
+        // (content_save_pre), KSES elimina los comentarios HTML del tipo
+        // <!-- wp:group --> / <!-- /wp:columns --> que usa Gutenberg para
+        // delimitar cada bloque/contenedor — el resultado visible es que la
+        // copia se abre con todo el contenido metido en un único bloque de
+        // texto en vez de conservar los bloques y contenedores originales.
+        // kses_remove_filters() quita esos filtros solo para esta inserción
+        // y kses_init_filters() los repone justo después, así que el resto
+        // del sitio (formularios, comentarios, etc.) sigue tan protegido
+        // como siempre.
+        kses_remove_filters();
+
         $new_id = wp_insert_post( [
             'post_title'     => $prefix . $original->post_title,
             'post_content'   => $original->post_content,
@@ -1438,6 +1468,8 @@ class Caracool_OneStep {
             'comment_status' => $original->comment_status,
             'ping_status'    => $original->ping_status,
         ], true );
+
+        kses_init_filters();
 
         if ( is_wp_error( $new_id ) ) return $new_id;
 
@@ -1458,7 +1490,16 @@ class Caracool_OneStep {
 
         // Post meta, salvo claves internas ya gestionadas arriba o que no
         // tiene sentido copiar (bloqueo de edición, slug antiguo...).
-        $skip_meta = [ '_edit_lock', '_edit_last', '_wp_old_slug', '_wp_page_template', '_thumbnail_id' ];
+        // '_elementor_css' se excluye a propósito: es la caché de Elementor
+        // (qué fichero CSS y qué "huella" de datos ya tiene generados), y
+        // apunta al fichero del post ORIGINAL (post-{ID}.css). Si se copia
+        // tal cual, Elementor cree que la copia ya tiene su CSS listo y no
+        // lo regenera — la copia se ve sin estilos (contenedores/columnas
+        // amontonados como texto plano) hasta que se pulsa "Regenerar CSS"
+        // a mano. Sin esta clave, Elementor genera su propio CSS la primera
+        // vez que se abre o se visita la copia, como con cualquier página
+        // nueva.
+        $skip_meta = [ '_edit_lock', '_edit_last', '_wp_old_slug', '_wp_page_template', '_thumbnail_id', '_elementor_css' ];
         foreach ( get_post_meta( $original->ID ) as $key => $values ) {
             if ( in_array( $key, $skip_meta, true ) ) continue;
             foreach ( (array) $values as $value ) {
@@ -1596,7 +1637,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'requires_php' => '7.4',
         'sections'     => [
             'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'changelog'   => '<h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
