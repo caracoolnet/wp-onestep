@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.2.0' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.3.0' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -177,7 +177,8 @@ class Caracool_OneStep {
 
             if ( '' === trim( $name ) && '' === trim( $code ) ) continue; // fila vacía, se descarta
 
-            $location = in_array( $row['location'] ?? '', [ 'head', 'footer' ], true ) ? $row['location'] : 'footer';
+            $type       = in_array( $row['type'] ?? '', [ 'html', 'php' ], true ) ? $row['type'] : 'html';
+            $location   = in_array( $row['location'] ?? '', [ 'head', 'footer' ], true ) ? $row['location'] : 'footer';
             $visibility = in_array( $row['visibility'] ?? '', [ 'all', 'all_except', 'only' ], true ) ? $row['visibility'] : 'all';
 
             $urls_raw = sanitize_textarea_field( wp_unslash( $row['urls'] ?? '' ) );
@@ -186,6 +187,7 @@ class Caracool_OneStep {
             $snippets[] = [
                 'name'       => $name,
                 'code'       => $code,
+                'type'       => $type,
                 'location'   => $location,
                 'active'     => ! empty( $row['active'] ),
                 'visibility' => $visibility,
@@ -203,6 +205,19 @@ class Caracool_OneStep {
 
         if ( isset( $_GET['saved'] ) ) {
             echo '<div class="notice notice-success is-dismissible"><p>✅ Configuración guardada.</p></div>';
+        }
+
+        // Aviso de un solo uso: un snippet PHP falló y se desactivó solo
+        // (ver snippet_disable_and_log()). Se borra al mostrarlo para que
+        // no reaparezca en cada carga del admin.
+        $php_error = get_option( 'caracool_onestep_php_error' );
+        if ( $php_error ) {
+            delete_option( 'caracool_onestep_php_error' );
+            printf(
+                '<div class="notice notice-error"><p>⚠️ El snippet PHP «%s» ha dado un error y se ha desactivado automáticamente para no dejar la web caída: <code>%s</code>. Corrígelo en la pestaña Código y vuelve a activarlo.</p></div>',
+                esc_html( $php_error['name'] ?? 'sin nombre' ),
+                esc_html( $php_error['message'] ?? '' )
+            );
         }
     }
 
@@ -315,9 +330,14 @@ class Caracool_OneStep {
             .co-snippet-meta{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
             .co-badge{ font-size:11px; font-weight:650; padding:3px 8px; border-radius:999px; background:var(--co-accent-soft); color:var(--co-accent-ink); white-space:nowrap; }
             .co-badge.muted{ background:#efeceb; color:var(--co-ink-soft); }
+            .co-badge-php{ background:#3b2f6b; color:#fff; }
             .co-icon-btn{ width:28px; height:28px; border-radius:7px; border:1px solid var(--co-border); background:#fff; display:flex; align-items:center; justify-content:center; cursor:pointer; color:var(--co-ink-soft); }
             .co-icon-btn:hover{ color:#b8382c; border-color:#e7c3bb; }
             .co-icon-btn svg{ width:14px; height:14px; }
+            .co-snippet-type-row{ margin-top:12px; max-width:340px; }
+            .co-snippet-type-row label{ display:block; font-size:11.5px; font-weight:610; color:var(--co-ink-soft); margin-bottom:4px; text-transform:uppercase; letter-spacing:.03em; }
+            .co-warn-box{ margin-top:10px; padding:10px 14px; background:#fdf3e3; border:1px solid #eccf94; border-radius:var(--co-radius-sm); font-size:12.5px; line-height:1.5; color:#7a5a12; }
+            .co-warn-box code{ background:rgba(122,90,18,.1); border-radius:4px; padding:1px 5px; font-size:11.5px; font-family:var(--co-mono); }
             .co-snippet-fields{ display:grid; grid-template-columns:1fr 1fr; gap:10px 14px; margin-top:12px; }
             .co-snippet-fields .co-full{ grid-column:1 / -1; }
             .co-snippet-fields label{ display:block; font-size:11.5px; font-weight:610; color:var(--co-ink-soft); margin-bottom:4px; text-transform:uppercase; letter-spacing:.03em; }
@@ -584,6 +604,7 @@ class Caracool_OneStep {
                     <p class="co-card-desc">
                         Inserta HTML, CSS o JavaScript (por ejemplo, el código de Google Analytics, Meta Pixel o Google Tag Manager) directamente en el <code>&lt;head&gt;</code> o antes de cerrar el <code>&lt;/body&gt;</code> del sitio, sin tocar el tema.
                         Un snippet inactivo, o si no hay ninguno guardado, no añade absolutamente nada al sitio — el módulo no engancha nada hasta que hay al menos uno activo.
+                        También puedes marcar un snippet como tipo <strong>PHP</strong> para que se ejecute de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página.
                     </p>
                     <p class="co-card-desc">
                         El código se pega tal cual, sin filtrar — igual que editar el tema directamente. Solo un administrador puede llegar hasta aquí, así que el riesgo es el mismo que el de cualquier cambio en el tema: revísalo antes de guardar.
@@ -600,10 +621,11 @@ class Caracool_OneStep {
                             if ( ! $snippets ) $snippets = [ [] ]; // al menos un bloque vacío para empezar
                             foreach ( $snippets as $i => $snippet ) :
                                 $snippet = wp_parse_args( $snippet, [
-                                    'name' => '', 'code' => '', 'location' => 'footer',
+                                    'name' => '', 'code' => '', 'type' => 'html', 'location' => 'footer',
                                     'active' => false, 'visibility' => 'all', 'urls' => [],
                                 ] );
                                 $co_url_count = count( (array) $snippet['urls'] );
+                                $co_is_php    = 'php' === $snippet['type'];
                                 ?>
                                 <div class="co-snippet co-snippet-block">
                                     <div class="co-snippet-top">
@@ -614,8 +636,10 @@ class Caracool_OneStep {
                                                 <span class="co-track"></span>
                                             </label>
                                             <span class="co-badge co-badge-active <?php echo $snippet['active'] ? '' : 'muted'; ?>"><?php echo $snippet['active'] ? 'Activo' : 'Inactivo'; ?></span>
-                                            <span class="co-badge muted"><?php echo 'head' === $snippet['location'] ? 'Head' : 'Footer'; ?></span>
-                                            <span class="co-badge muted">
+                                            <span class="co-badge co-badge-type <?php echo $co_is_php ? 'co-badge-php' : 'muted'; ?>">
+                                                <?php echo $co_is_php ? 'PHP' : ( 'head' === $snippet['location'] ? 'Head' : 'Footer' ); ?>
+                                            </span>
+                                            <span class="co-badge muted co-snippet-vis-badge" style="<?php echo $co_is_php ? 'display:none;' : ''; ?>">
                                                 <?php
                                                 if ( 'all_except' === $snippet['visibility'] ) echo 'Excluye ' . (int) $co_url_count . ' URL(s)';
                                                 elseif ( 'only' === $snippet['visibility'] ) echo 'Solo ' . (int) $co_url_count . ' URL(s)';
@@ -628,9 +652,21 @@ class Caracool_OneStep {
                                         </div>
                                     </div>
 
-                                    <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code" placeholder="&lt;script&gt;...&lt;/script&gt;" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
+                                    <div class="co-snippet-type-row">
+                                        <label>Tipo</label>
+                                        <select class="co-snippet-type" name="snippets[<?php echo (int) $i; ?>][type]">
+                                            <option value="html" <?php selected( $snippet['type'], 'html' ); ?>>HTML / CSS / JS — se imprime en la página</option>
+                                            <option value="php" <?php selected( $snippet['type'], 'php' ); ?>>PHP — se ejecuta en el servidor</option>
+                                        </select>
+                                    </div>
 
-                                    <div class="co-snippet-fields">
+                                    <div class="co-warn-box co-snippet-php-warning" style="<?php echo $co_is_php ? '' : 'display:none;'; ?>">
+                                        ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
+                                    </div>
+
+                                    <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code co-snippet-code" placeholder="<?php echo $co_is_php ? esc_attr( "add_action( 'init', function () {\n    // tu código PHP aquí, sin <?php\n} );" ) : '<script>...</script>'; ?>" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
+
+                                    <div class="co-snippet-fields co-snippet-html-fields" style="<?php echo $co_is_php ? 'display:none;' : ''; ?>">
                                         <div>
                                             <label>Ubicación</label>
                                             <select name="snippets[<?php echo (int) $i; ?>][location]">
@@ -686,17 +722,29 @@ class Caracool_OneStep {
                             <span class="co-track"></span>
                         </label>
                         <span class="co-badge co-badge-active muted">Inactivo</span>
-                        <span class="co-badge muted">Footer</span>
-                        <span class="co-badge muted">Todo el sitio</span>
+                        <span class="co-badge co-badge-type muted">Footer</span>
+                        <span class="co-badge muted co-snippet-vis-badge">Todo el sitio</span>
                         <button type="button" class="co-icon-btn co-remove-snippet" title="Quitar este snippet">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
                         </button>
                     </div>
                 </div>
 
-                <textarea name="snippets[__I__][code]" rows="5" class="code" placeholder="&lt;script&gt;...&lt;/script&gt;" style="margin-top:12px;"></textarea>
+                <div class="co-snippet-type-row">
+                    <label>Tipo</label>
+                    <select class="co-snippet-type" name="snippets[__I__][type]">
+                        <option value="html" selected>HTML / CSS / JS — se imprime en la página</option>
+                        <option value="php">PHP — se ejecuta en el servidor</option>
+                    </select>
+                </div>
 
-                <div class="co-snippet-fields">
+                <div class="co-warn-box co-snippet-php-warning" style="display:none;">
+                    ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
+                </div>
+
+                <textarea name="snippets[__I__][code]" rows="5" class="code co-snippet-code" placeholder="&lt;script&gt;...&lt;/script&gt;" style="margin-top:12px;"></textarea>
+
+                <div class="co-snippet-fields co-snippet-html-fields">
                     <div>
                         <label>Ubicación</label>
                         <select name="snippets[__I__][location]">
@@ -787,6 +835,44 @@ class Caracool_OneStep {
                         activeBadge.classList.toggle('muted', ! this.checked);
                     });
                 }
+
+                // ── Tipo de snippet: HTML/JS (se imprime) vs PHP (se ejecuta) ──
+                var typeSelect  = block.querySelector('.co-snippet-type');
+                var typeBadge   = block.querySelector('.co-badge-type');
+                var visBadge    = block.querySelector('.co-snippet-vis-badge');
+                var phpWarning  = block.querySelector('.co-snippet-php-warning');
+                var htmlFields  = block.querySelector('.co-snippet-html-fields');
+                var codeField   = block.querySelector('.co-snippet-code');
+                var locationSel = block.querySelector('select[name$="[location]"]');
+                if (typeSelect) {
+                    typeSelect.addEventListener('change', function () {
+                        var isPhp = (this.value === 'php');
+                        if (phpWarning) phpWarning.style.display = isPhp ? '' : 'none';
+                        if (htmlFields) htmlFields.style.display = isPhp ? 'none' : '';
+                        if (visBadge)   visBadge.style.display   = isPhp ? 'none' : '';
+                        if (typeBadge) {
+                            typeBadge.classList.toggle('co-badge-php', isPhp);
+                            if (isPhp) {
+                                typeBadge.textContent = 'PHP';
+                            } else {
+                                typeBadge.textContent = (locationSel && locationSel.value === 'head') ? 'Head' : 'Footer';
+                            }
+                        }
+                        if (codeField) {
+                            codeField.placeholder = isPhp
+                                ? "add_action( 'init', function () {\n    // tu código PHP aquí, sin <?php\n} );"
+                                : '<script>...</script>';
+                        }
+                    });
+                }
+                if (locationSel && typeBadge) {
+                    locationSel.addEventListener('change', function () {
+                        if (! typeBadge.classList.contains('co-badge-php')) {
+                            typeBadge.textContent = (this.value === 'head') ? 'Head' : 'Footer';
+                        }
+                    });
+                }
+
                 var removeBtn = block.querySelector('.co-remove-snippet');
                 if (removeBtn) {
                     removeBtn.addEventListener('click', function () {
@@ -798,6 +884,7 @@ class Caracool_OneStep {
                         } else {
                             block.querySelectorAll('input[type=text], textarea').forEach(function (f) { f.value = ''; });
                             block.querySelectorAll('input[type=checkbox]').forEach(function (f) { f.checked = false; });
+                            if (typeSelect) { typeSelect.value = 'html'; typeSelect.dispatchEvent(new Event('change')); }
                         }
                     });
                 }
@@ -1084,31 +1171,52 @@ class Caracool_OneStep {
 
     // ─────────────────────────────────────────────────────────
     // MÓDULO: CÓDIGO PERSONALIZADO
-    // Inserta snippets guardados por el admin en el head o el footer.
+    // Dos tipos de snippet, guardados por el admin:
+    //  - "html": se imprime tal cual en el head o el footer (sin wp_kses_post
+    //    ni similar, igual que el HTML personalizado de mantenimiento —
+    //    filtrarlo rompería el propio propósito del módulo).
+    //  - "php": se ejecuta de verdad en el servidor vía eval(), envuelto en
+    //    un try/catch para que un error en el snippet no tire toda la web
+    //    abajo (ver snippets_run_php más abajo).
     // Coste cero si no hay ningún snippet activo: no se engancha nada en
-    // wp_head/wp_footer a menos que exista al menos uno. El código se
-    // imprime tal cual (sin wp_kses_post ni similar) porque, igual que con
-    // el HTML personalizado de mantenimiento, filtrarlo rompería el propio
-    // propósito del módulo (scripts de analítica, pixels, etc. no son HTML
-    // "de contenido"). Solo un administrador (manage_options) puede llegar
-    // hasta aquí, así que el nivel de confianza es el mismo que editar el
-    // tema directamente — no se expone a roles inferiores.
+    // wp_head/wp_footer/plugins_loaded a menos que exista al menos uno del
+    // tipo correspondiente. Solo un administrador (manage_options) puede
+    // llegar hasta aquí, así que el nivel de confianza es el mismo que
+    // editar el tema directamente — no se expone a roles inferiores.
     // ─────────────────────────────────────────────────────────
     private $active_snippets = [];
 
     private function snippets_bootstrap( $settings ) {
         $snippets = is_array( $settings['snippets'] ?? null ) ? $settings['snippets'] : [];
 
-        $active = array_values( array_filter( $snippets, function ( $snippet ) {
+        // Se preservan las claves originales (sin array_values) para poder
+        // desactivar exactamente el snippet que falle, por índice, si un
+        // snippet PHP lanza un error — ver snippet_disable_and_log().
+        $active = array_filter( $snippets, function ( $snippet ) {
             return ! empty( $snippet['active'] ) && '' !== trim( $snippet['code'] ?? '' );
-        } ) );
+        } );
 
         if ( ! $active ) return; // nada activo → no se engancha nada, coste cero
 
         $this->active_snippets = $active;
 
-        add_action( 'wp_head', [ $this, 'snippets_print_head' ], 999 );
-        add_action( 'wp_footer', [ $this, 'snippets_print_footer' ], 999 );
+        $has_html = false;
+        $has_php  = false;
+        foreach ( $active as $snippet ) {
+            if ( 'php' === ( $snippet['type'] ?? 'html' ) ) $has_php = true;
+            else $has_html = true;
+        }
+
+        if ( $has_html ) {
+            add_action( 'wp_head', [ $this, 'snippets_print_head' ], 999 );
+            add_action( 'wp_footer', [ $this, 'snippets_print_footer' ], 999 );
+        }
+        if ( $has_php ) {
+            // 'plugins_loaded' → después de que WordPress y el resto de
+            // plugins (WooCommerce incluido) ya se hayan cargado, para que
+            // add_action/add_filter/WC() estén disponibles en el snippet.
+            add_action( 'plugins_loaded', [ $this, 'snippets_run_php' ] );
+        }
     }
 
     public function snippets_print_head() {
@@ -1121,12 +1229,90 @@ class Caracool_OneStep {
 
     private function snippets_print_for_location( $location ) {
         foreach ( $this->active_snippets as $snippet ) {
+            if ( 'php' === ( $snippet['type'] ?? 'html' ) ) continue; // los PHP no se imprimen, se ejecutan
             if ( ( $snippet['location'] ?? 'footer' ) !== $location ) continue;
             if ( ! $this->snippet_applies_to_current_url( $snippet ) ) continue;
 
             $label = $snippet['name'] ? $snippet['name'] : 'sin nombre';
             echo "\n<!-- Caracool OneStep · " . esc_html( $label ) . " -->\n" . $snippet['code'] . "\n";
         }
+    }
+
+    /**
+     * Ejecuta los snippets de tipo "php". Cada uno se envuelve en un
+     * try/catch(\Throwable): en PHP 7+ esto captura tanto errores de
+     * sintaxis (ParseError) como la mayoría de errores en tiempo de
+     * ejecución (TypeError, Error de función no definida, etc.), así que
+     * un snippet mal escrito no debería poder tirar la web entera.
+     *
+     * Como red de seguridad adicional para el puñado de fallos que ni
+     * siquiera un try/catch puede interceptar, se guarda en una option
+     * temporal qué snippet se está ejecutando ahora mismo; si la petición
+     * muere ahí sin que lleguemos a limpiarla, una shutdown function lo
+     * detecta y desactiva ese snippet en concreto, para que la web se
+     * recupere sola en la siguiente carga de página. Ver
+     * snippets_shutdown_check().
+     */
+    public function snippets_run_php() {
+        $php_indexes = [];
+        foreach ( $this->active_snippets as $index => $snippet ) {
+            if ( 'php' === ( $snippet['type'] ?? 'html' ) ) $php_indexes[] = $index;
+        }
+        if ( ! $php_indexes ) return;
+
+        register_shutdown_function( [ $this, 'snippets_shutdown_check' ] );
+
+        foreach ( $php_indexes as $index ) {
+            $snippet = $this->active_snippets[ $index ];
+            update_option( 'caracool_onestep_php_running', $index, false );
+            try {
+                eval( $snippet['code'] );
+            } catch ( \Throwable $e ) {
+                $this->snippet_disable_and_log( $index, $snippet, $e->getMessage() );
+            }
+        }
+
+        delete_option( 'caracool_onestep_php_running' );
+    }
+
+    /**
+     * Red de seguridad: si la petición murió a mitad de un eval() sin
+     * pasar por el catch (un fallo no capturable como Throwable), la
+     * option "caracool_onestep_php_running" se queda con el índice del
+     * snippet que estaba en marcha. Se desactiva ese snippet y se guarda
+     * el error para avisar en el admin.
+     */
+    public function snippets_shutdown_check() {
+        $running = get_option( 'caracool_onestep_php_running', null );
+        if ( null === $running || '' === $running ) return; // terminó bien, nada a medias
+
+        $error = error_get_last();
+        if ( $error && in_array( $error['type'], [ E_ERROR, E_PARSE, E_COMPILE_ERROR, E_USER_ERROR ], true ) ) {
+            $snippet = $this->active_snippets[ $running ] ?? [ 'name' => '', 'code' => '' ];
+            $this->snippet_disable_and_log( $running, $snippet, $error['message'] );
+        }
+
+        delete_option( 'caracool_onestep_php_running' );
+    }
+
+    /**
+     * Desactiva (por índice) el snippet PHP que ha fallado y guarda el
+     * error en una option de un solo uso para mostrarlo como aviso en el
+     * admin (ver admin_notices()).
+     */
+    private function snippet_disable_and_log( $index, $snippet, $error_message ) {
+        $settings = $this->get_settings();
+        $snippets = (array) ( $settings['snippets'] ?? [] );
+
+        if ( isset( $snippets[ $index ] ) ) {
+            $snippets[ $index ]['active'] = false;
+            update_option( self::OPTION_KEY, array_merge( $settings, [ 'snippets' => $snippets ] ) );
+        }
+
+        update_option( 'caracool_onestep_php_error', [
+            'name'    => $snippet['name'] ? $snippet['name'] : 'sin nombre',
+            'message' => $error_message,
+        ] );
     }
 
     private function snippet_applies_to_current_url( $snippet ) {
@@ -1410,7 +1596,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'requires_php' => '7.4',
         'sections'     => [
             'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'changelog'   => '<h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
