@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.3.2
+ * Version:     1.3.3
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.3.2' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.3.3' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -664,7 +664,7 @@ class Caracool_OneStep {
                                         ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
                                     </div>
 
-                                    <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code co-snippet-code" placeholder="<?php echo $co_is_php ? esc_attr( "add_action( 'init', function () {\n    // tu código PHP aquí (sin las etiquetas de apertura/cierre de PHP)\n} );" ) : '<script>...</script>'; ?>" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
+                                    <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code co-snippet-code" placeholder="<?php echo $co_is_php ? esc_attr( "add_action( 'init', function () {\n    // tu código PHP aquí (sin las etiquetas de apertura/cierre de PHP)\n} );" ) : esc_attr( "<div class=\"mi-bloque\">\n    ...\n</div>" ); ?>" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
 
                                     <div class="co-snippet-fields co-snippet-html-fields" style="<?php echo $co_is_php ? 'display:none;' : ''; ?>">
                                         <div>
@@ -742,7 +742,7 @@ class Caracool_OneStep {
                     ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
                 </div>
 
-                <textarea name="snippets[__I__][code]" rows="5" class="code co-snippet-code" placeholder="&lt;script&gt;...&lt;/script&gt;" style="margin-top:12px;"></textarea>
+                <textarea name="snippets[__I__][code]" rows="5" class="code co-snippet-code" placeholder="&lt;div class=&quot;mi-bloque&quot;&gt;...&lt;/div&gt;" style="margin-top:12px;"></textarea>
 
                 <div class="co-snippet-fields co-snippet-html-fields">
                     <div>
@@ -861,7 +861,7 @@ class Caracool_OneStep {
                         if (codeField) {
                             codeField.placeholder = isPhp
                                 ? "add_action( 'init', function () {\n    // tu código PHP aquí (sin las etiquetas de apertura/cierre de PHP)\n} );"
-                                : '<script>...</script>';
+                                : "<div class=\"mi-bloque\">\n    ...\n</div>";
                         }
                     });
                 }
@@ -1637,7 +1637,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'requires_php' => '7.4',
         'sections'     => [
             'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'changelog'   => '<h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
