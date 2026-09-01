@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.3.4
+ * Version:     1.3.5
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.3.4' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.3.5' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -328,6 +328,13 @@ class Caracool_OneStep {
             .co-snippet-top{ display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
             .co-snippet-top .co-name-input{ font-weight:600; max-width:280px; border:none; background:transparent; padding:6px 0; }
             .co-snippet-meta{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+            .co-snippet-toggle{ flex-shrink:0; }
+            .co-snippet-toggle svg{ transition:transform .15s ease; }
+            .co-snippet.co-collapsed .co-snippet-toggle svg{ transform:rotate(-90deg); }
+            .co-snippet-body{ overflow:hidden; }
+            .co-snippet.co-collapsed .co-snippet-body{ display:none; }
+            .co-snippets-bulk-toggle{ background:none; border:none; padding:0; font-size:12.5px; font-weight:610; color:var(--co-ink-soft); cursor:pointer; text-decoration:underline; text-underline-offset:2px; }
+            .co-snippets-bulk-toggle:hover{ color:var(--co-ink); }
             .co-badge{ font-size:11px; font-weight:650; padding:3px 8px; border-radius:999px; background:var(--co-accent-soft); color:var(--co-accent-ink); white-space:nowrap; }
             .co-badge.muted{ background:#efeceb; color:var(--co-ink-soft); }
             .co-badge-php{ background:#3b2f6b; color:#fff; }
@@ -626,9 +633,16 @@ class Caracool_OneStep {
                                 ] );
                                 $co_url_count = count( (array) $snippet['urls'] );
                                 $co_is_php    = 'php' === $snippet['type'];
+                                // Los snippets que ya traen código guardado arrancan
+                                // plegados (para no saturar la pantalla si hay varios);
+                                // un bloque vacío se muestra abierto, listo para escribir.
+                                $co_start_collapsed = '' !== trim( $snippet['code'] );
                                 ?>
-                                <div class="co-snippet co-snippet-block">
+                                <div class="co-snippet co-snippet-block<?php echo $co_start_collapsed ? ' co-collapsed' : ''; ?>">
                                     <div class="co-snippet-top">
+                                        <button type="button" class="co-icon-btn co-snippet-toggle" title="Mostrar/ocultar código">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                        </button>
                                         <input type="text" name="snippets[<?php echo (int) $i; ?>][name]" value="<?php echo esc_attr( $snippet['name'] ); ?>" class="co-name-input" placeholder="Ej. Google Analytics">
                                         <div class="co-snippet-meta">
                                             <label class="co-switch co-switch-sm" title="Activo">
@@ -652,40 +666,42 @@ class Caracool_OneStep {
                                         </div>
                                     </div>
 
-                                    <div class="co-snippet-type-row">
-                                        <label>Tipo</label>
-                                        <select class="co-snippet-type" name="snippets[<?php echo (int) $i; ?>][type]">
-                                            <option value="html" <?php selected( $snippet['type'], 'html' ); ?>>HTML / CSS / JS — se imprime en la página</option>
-                                            <option value="php" <?php selected( $snippet['type'], 'php' ); ?>>PHP — se ejecuta en el servidor</option>
-                                        </select>
-                                    </div>
-
-                                    <div class="co-warn-box co-snippet-php-warning" style="<?php echo $co_is_php ? '' : 'display:none;'; ?>">
-                                        ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
-                                    </div>
-
-                                    <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code co-snippet-code" placeholder="<?php echo $co_is_php ? esc_attr( "add_action( 'init', function () {\n    // tu código PHP aquí (sin las etiquetas de apertura/cierre de PHP)\n} );" ) : esc_attr( "<div class=\"mi-bloque\">\n    ...\n</div>" ); ?>" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
-
-                                    <div class="co-snippet-fields co-snippet-html-fields" style="<?php echo $co_is_php ? 'display:none;' : ''; ?>">
-                                        <div>
-                                            <label>Ubicación</label>
-                                            <select name="snippets[<?php echo (int) $i; ?>][location]">
-                                                <option value="head" <?php selected( $snippet['location'], 'head' ); ?>>Head (antes de &lt;/head&gt;)</option>
-                                                <option value="footer" <?php selected( $snippet['location'], 'footer' ); ?>>Footer (antes de &lt;/body&gt;)</option>
+                                    <div class="co-snippet-body">
+                                        <div class="co-snippet-type-row">
+                                            <label>Tipo</label>
+                                            <select class="co-snippet-type" name="snippets[<?php echo (int) $i; ?>][type]">
+                                                <option value="html" <?php selected( $snippet['type'], 'html' ); ?>>HTML / CSS / JS — se imprime en la página</option>
+                                                <option value="php" <?php selected( $snippet['type'], 'php' ); ?>>PHP — se ejecuta en el servidor</option>
                                             </select>
                                         </div>
-                                        <div>
-                                            <label>Dónde se muestra</label>
-                                            <select class="co-snippet-visibility" name="snippets[<?php echo (int) $i; ?>][visibility]">
-                                                <option value="all" <?php selected( $snippet['visibility'], 'all' ); ?>>Todo el sitio</option>
-                                                <option value="all_except" <?php selected( $snippet['visibility'], 'all_except' ); ?>>Todo el sitio, excepto estas URLs</option>
-                                                <option value="only" <?php selected( $snippet['visibility'], 'only' ); ?>>Solo estas URLs</option>
-                                            </select>
+
+                                        <div class="co-warn-box co-snippet-php-warning" style="<?php echo $co_is_php ? '' : 'display:none;'; ?>">
+                                            ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
                                         </div>
-                                        <div class="co-full co-snippet-urls-row" style="<?php echo 'all' === $snippet['visibility'] ? 'display:none;' : ''; ?>">
-                                            <label>URLs (una por línea)</label>
-                                            <textarea name="snippets[<?php echo (int) $i; ?>][urls]" rows="2" placeholder="/contacto/&#10;/blog/*"><?php echo esc_textarea( implode( "\n", (array) $snippet['urls'] ) ); ?></textarea>
-                                            <p class="co-field-hint" style="margin-top:4px;">Ruta exacta (<code>/contacto/</code>) o con <code>*</code> al final para un grupo (<code>/blog/*</code>).</p>
+
+                                        <textarea name="snippets[<?php echo (int) $i; ?>][code]" rows="5" class="code co-snippet-code" placeholder="<?php echo $co_is_php ? esc_attr( "add_action( 'init', function () {\n    // tu código PHP aquí (sin las etiquetas de apertura/cierre de PHP)\n} );" ) : esc_attr( "<div class=\"mi-bloque\">\n    ...\n</div>" ); ?>" style="margin-top:12px;"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
+
+                                        <div class="co-snippet-fields co-snippet-html-fields" style="<?php echo $co_is_php ? 'display:none;' : ''; ?>">
+                                            <div>
+                                                <label>Ubicación</label>
+                                                <select name="snippets[<?php echo (int) $i; ?>][location]">
+                                                    <option value="head" <?php selected( $snippet['location'], 'head' ); ?>>Head (antes de &lt;/head&gt;)</option>
+                                                    <option value="footer" <?php selected( $snippet['location'], 'footer' ); ?>>Footer (antes de &lt;/body&gt;)</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label>Dónde se muestra</label>
+                                                <select class="co-snippet-visibility" name="snippets[<?php echo (int) $i; ?>][visibility]">
+                                                    <option value="all" <?php selected( $snippet['visibility'], 'all' ); ?>>Todo el sitio</option>
+                                                    <option value="all_except" <?php selected( $snippet['visibility'], 'all_except' ); ?>>Todo el sitio, excepto estas URLs</option>
+                                                    <option value="only" <?php selected( $snippet['visibility'], 'only' ); ?>>Solo estas URLs</option>
+                                                </select>
+                                            </div>
+                                            <div class="co-full co-snippet-urls-row" style="<?php echo 'all' === $snippet['visibility'] ? 'display:none;' : ''; ?>">
+                                                <label>URLs (una por línea)</label>
+                                                <textarea name="snippets[<?php echo (int) $i; ?>][urls]" rows="2" placeholder="/contacto/&#10;/blog/*"><?php echo esc_textarea( implode( "\n", (array) $snippet['urls'] ) ); ?></textarea>
+                                                <p class="co-field-hint" style="margin-top:4px;">Ruta exacta (<code>/contacto/</code>) o con <code>*</code> al final para un grupo (<code>/blog/*</code>).</p>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -697,6 +713,9 @@ class Caracool_OneStep {
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" stroke-linecap="round" stroke-linejoin="round"/></svg>
                                 Añadir snippet
                             </button>
+                            <?php if ( count( $snippets ) > 1 ) : ?>
+                                <button type="button" class="co-snippets-bulk-toggle" id="co-snippets-bulk-toggle" data-mode="expand">Expandir todos</button>
+                            <?php endif; ?>
                         </div>
 
                         <div class="co-btn-row">
@@ -715,6 +734,9 @@ class Caracool_OneStep {
         <template id="co-snippet-template">
             <div class="co-snippet co-snippet-block">
                 <div class="co-snippet-top">
+                    <button type="button" class="co-icon-btn co-snippet-toggle" title="Mostrar/ocultar código">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
                     <input type="text" name="snippets[__I__][name]" value="" class="co-name-input" placeholder="Ej. Google Analytics">
                     <div class="co-snippet-meta">
                         <label class="co-switch co-switch-sm" title="Activo">
@@ -730,40 +752,42 @@ class Caracool_OneStep {
                     </div>
                 </div>
 
-                <div class="co-snippet-type-row">
-                    <label>Tipo</label>
-                    <select class="co-snippet-type" name="snippets[__I__][type]">
-                        <option value="html" selected>HTML / CSS / JS — se imprime en la página</option>
-                        <option value="php">PHP — se ejecuta en el servidor</option>
-                    </select>
-                </div>
-
-                <div class="co-warn-box co-snippet-php-warning" style="display:none;">
-                    ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
-                </div>
-
-                <textarea name="snippets[__I__][code]" rows="5" class="code co-snippet-code" placeholder="&lt;div class=&quot;mi-bloque&quot;&gt;...&lt;/div&gt;" style="margin-top:12px;"></textarea>
-
-                <div class="co-snippet-fields co-snippet-html-fields">
-                    <div>
-                        <label>Ubicación</label>
-                        <select name="snippets[__I__][location]">
-                            <option value="head">Head (antes de &lt;/head&gt;)</option>
-                            <option value="footer" selected>Footer (antes de &lt;/body&gt;)</option>
+                <div class="co-snippet-body">
+                    <div class="co-snippet-type-row">
+                        <label>Tipo</label>
+                        <select class="co-snippet-type" name="snippets[__I__][type]">
+                            <option value="html" selected>HTML / CSS / JS — se imprime en la página</option>
+                            <option value="php">PHP — se ejecuta en el servidor</option>
                         </select>
                     </div>
-                    <div>
-                        <label>Dónde se muestra</label>
-                        <select class="co-snippet-visibility" name="snippets[__I__][visibility]">
-                            <option value="all" selected>Todo el sitio</option>
-                            <option value="all_except">Todo el sitio, excepto estas URLs</option>
-                            <option value="only">Solo estas URLs</option>
-                        </select>
+
+                    <div class="co-warn-box co-snippet-php-warning" style="display:none;">
+                        ⚠️ Este código se ejecuta como PHP real en el servidor, en cada carga de página — un error aquí es más delicado que en un snippet HTML/JS. No incluyas las etiquetas <code>&lt;?php</code> ni <code>?&gt;</code>, pega solo el código PHP. Si el snippet falla, OneStep lo desactiva solo para no dejar la web caída y te avisa arriba con el error — pero revísalo bien antes de guardar.
                     </div>
-                    <div class="co-full co-snippet-urls-row" style="display:none;">
-                        <label>URLs (una por línea)</label>
-                        <textarea name="snippets[__I__][urls]" rows="2" placeholder="/contacto/&#10;/blog/*"></textarea>
-                        <p class="co-field-hint" style="margin-top:4px;">Ruta exacta (<code>/contacto/</code>) o con <code>*</code> al final para un grupo (<code>/blog/*</code>).</p>
+
+                    <textarea name="snippets[__I__][code]" rows="5" class="code co-snippet-code" placeholder="&lt;div class=&quot;mi-bloque&quot;&gt;...&lt;/div&gt;" style="margin-top:12px;"></textarea>
+
+                    <div class="co-snippet-fields co-snippet-html-fields">
+                        <div>
+                            <label>Ubicación</label>
+                            <select name="snippets[__I__][location]">
+                                <option value="head">Head (antes de &lt;/head&gt;)</option>
+                                <option value="footer" selected>Footer (antes de &lt;/body&gt;)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Dónde se muestra</label>
+                            <select class="co-snippet-visibility" name="snippets[__I__][visibility]">
+                                <option value="all" selected>Todo el sitio</option>
+                                <option value="all_except">Todo el sitio, excepto estas URLs</option>
+                                <option value="only">Solo estas URLs</option>
+                            </select>
+                        </div>
+                        <div class="co-full co-snippet-urls-row" style="display:none;">
+                            <label>URLs (una por línea)</label>
+                            <textarea name="snippets[__I__][urls]" rows="2" placeholder="/contacto/&#10;/blog/*"></textarea>
+                            <p class="co-field-hint" style="margin-top:4px;">Ruta exacta (<code>/contacto/</code>) o con <code>*</code> al final para un grupo (<code>/blog/*</code>).</p>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -820,6 +844,13 @@ class Caracool_OneStep {
             // según la visibilidad elegida, badge de activo/inactivo, y
             // bloques de snippet repetibles ──
             function coBindSnippetBlock(block) {
+                var toggleBtn = block.querySelector('.co-snippet-toggle');
+                if (toggleBtn) {
+                    toggleBtn.addEventListener('click', function () {
+                        block.classList.toggle('co-collapsed');
+                    });
+                }
+
                 var visSelect = block.querySelector('.co-snippet-visibility');
                 var urlsRow   = block.querySelector('.co-snippet-urls-row');
                 if (visSelect && urlsRow) {
@@ -891,6 +922,36 @@ class Caracool_OneStep {
             }
             document.querySelectorAll('#co-snippets-list .co-snippet-block').forEach(coBindSnippetBlock);
 
+            // ── Expandir/Contraer todos los snippets a la vez ──────
+            function coBindBulkToggle(btn) {
+                btn.addEventListener('click', function () {
+                    var list = document.getElementById('co-snippets-list');
+                    var blocks = list.querySelectorAll('.co-snippet-block');
+                    var expand = btn.dataset.mode === 'expand';
+                    blocks.forEach(function (b) { b.classList.toggle('co-collapsed', ! expand); });
+                    btn.dataset.mode = expand ? 'collapse' : 'expand';
+                    btn.textContent = expand ? 'Contraer todos' : 'Expandir todos';
+                });
+            }
+            var bulkToggleBtn = document.getElementById('co-snippets-bulk-toggle');
+            if (bulkToggleBtn) coBindBulkToggle(bulkToggleBtn);
+
+            function coEnsureBulkToggle() {
+                var list = document.getElementById('co-snippets-list');
+                if (list.querySelectorAll('.co-snippet-block').length <= 1) return;
+                bulkToggleBtn = document.getElementById('co-snippets-bulk-toggle');
+                if (bulkToggleBtn) return;
+                bulkToggleBtn = document.createElement('button');
+                bulkToggleBtn.type = 'button';
+                bulkToggleBtn.id = 'co-snippets-bulk-toggle';
+                bulkToggleBtn.className = 'co-snippets-bulk-toggle';
+                bulkToggleBtn.dataset.mode = 'expand';
+                bulkToggleBtn.textContent = 'Expandir todos';
+                var addBtn = document.getElementById('co-add-snippet');
+                if (addBtn && addBtn.parentNode) addBtn.parentNode.appendChild(bulkToggleBtn);
+                coBindBulkToggle(bulkToggleBtn);
+            }
+
             var addSnippetBtn = document.getElementById('co-add-snippet');
             var snippetTemplate = document.getElementById('co-snippet-template');
             if (addSnippetBtn && snippetTemplate) {
@@ -903,6 +964,7 @@ class Caracool_OneStep {
                     var block = wrapper.firstElementChild;
                     list.appendChild(block);
                     coBindSnippetBlock(block);
+                    coEnsureBulkToggle();
                 });
             }
         })();
@@ -1667,7 +1729,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'requires_php' => '7.4',
         'sections'     => [
             'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.3.4</h4><p><strong>Corrección:</strong> el módulo Duplicar seguía sin funcionar bien en páginas de Elementor en algunos hostings: la copia se abría en el editor de Elementor pero con todo el contenido metido en un único bloque de texto, como si Elementor no reconociera su estructura interna. Causa real: al copiar los metadatos de la página, WordPress devolvía una versión recortada de la estructura interna de Elementor (probablemente por algún filtro o caché de terceros propio de ese hosting), y esa versión incompleta era la que se guardaba en la copia. Ahora esos metadatos se copian leyendo y escribiendo directamente en la base de datos, evitando cualquier filtro que pueda alterarlos por el camino. Si duplicar páginas de Elementor te seguía dando problemas tras la 1.3.1, esta versión lo soluciona.</p><h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'changelog'   => '<h4>1.3.5</h4><p>En la pestaña Código personalizado, cada snippet ahora se puede plegar y desplegar (como un desplegable/acordeón), en vez de mostrarse siempre abierto con todo el código a la vista. Los snippets que ya tienen código guardado arrancan plegados para que la pantalla no se sature si hay varios; un bloque vacío se muestra abierto, listo para escribir. Con más de un snippet aparece también un enlace para expandir o contraer todos a la vez.</p><h4>1.3.4</h4><p><strong>Corrección:</strong> el módulo Duplicar seguía sin funcionar bien en páginas de Elementor en algunos hostings: la copia se abría en el editor de Elementor pero con todo el contenido metido en un único bloque de texto, como si Elementor no reconociera su estructura interna. Causa real: al copiar los metadatos de la página, WordPress devolvía una versión recortada de la estructura interna de Elementor (probablemente por algún filtro o caché de terceros propio de ese hosting), y esa versión incompleta era la que se guardaba en la copia. Ahora esos metadatos se copian leyendo y escribiendo directamente en la base de datos, evitando cualquier filtro que pueda alterarlos por el camino. Si duplicar páginas de Elementor te seguía dando problemas tras la 1.3.1, esta versión lo soluciona.</p><h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
