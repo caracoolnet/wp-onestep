@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.3.5
+ * Version:     1.3.6
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,10 +12,14 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.3.5' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.3.6' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
+
+// Menú compartido "Caracool" de todos los plugins de la casa (Motion, Carta,
+// OneStep, Churra): archivo idéntico en cada uno, ver inc/caracool-menu.php.
+require_once CARACOOL_ONESTEP_PATH . 'inc/caracool-menu.php';
 
 // ─────────────────────────────────────────────────────────────
 // CLASE PRINCIPAL
@@ -41,6 +45,7 @@ class Caracool_OneStep {
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_admin_scripts' ] );
         add_action( 'admin_notices',         [ $this, 'admin_notices' ] );
         add_action( 'admin_post_caracool_onestep_save', [ $this, 'save_settings' ] );
+        add_filter( 'caracool_plugins',      [ $this, 'presentarse' ] );
 
         $settings = $this->get_settings();
 
@@ -201,7 +206,7 @@ class Caracool_OneStep {
     // ── Avisos admin ──────────────────────────────────────────
     public function admin_notices() {
         $screen = get_current_screen();
-        if ( ! $screen || $screen->id !== 'toplevel_page_' . CARACOOL_ONESTEP_SLUG ) return;
+        if ( ! $screen || $screen->id !== CARACOOL_MENU_SLUG . '_page_' . CARACOOL_ONESTEP_SLUG ) return;
 
         if ( isset( $_GET['saved'] ) ) {
             echo '<div class="notice notice-success is-dismissible"><p>✅ Configuración guardada.</p></div>';
@@ -222,20 +227,36 @@ class Caracool_OneStep {
     }
 
     // ── Menú admin ────────────────────────────────────────────
+    // Submenú del menú compartido "Caracool" (ver inc/caracool-menu.php). El
+    // slug de la página no cambia, así que ningún enlace guardado ni ningún
+    // admin.php?page=caracool-onestep se rompe.
     public function add_menu() {
-        add_menu_page(
+        add_submenu_page(
+            CARACOOL_MENU_SLUG,
             'Caracool OneStep',
-            'Caracool OneStep',
+            'OneStep',
             'manage_options',
             CARACOOL_ONESTEP_SLUG,
-            [ $this, 'render_settings_page' ],
-            'dashicons-admin-generic',
-            80
+            [ $this, 'render_settings_page' ]
         );
     }
 
+    /**
+     * Se presenta en la portada del menú compartido "Caracool" (filtro
+     * `caracool_plugins`, ver inc/caracool-menu.php).
+     */
+    public function presentarse( $lista ) {
+        $lista[] = [
+            'nombre'  => 'OneStep',
+            'pagina'  => CARACOOL_ONESTEP_SLUG,
+            'version' => CARACOOL_ONESTEP_VERSION,
+            'resumen' => 'Comentarios, mantenimiento y código personalizado',
+        ];
+        return $lista;
+    }
+
     public function enqueue_admin_scripts( $hook ) {
-        if ( $hook !== 'toplevel_page_' . CARACOOL_ONESTEP_SLUG ) return;
+        if ( $hook !== CARACOOL_MENU_SLUG . '_page_' . CARACOOL_ONESTEP_SLUG ) return;
         wp_enqueue_media();
         wp_enqueue_style( 'wp-color-picker' );
         wp_enqueue_script( 'wp-color-picker' );
@@ -1729,7 +1750,7 @@ add_filter( 'plugins_api', function ( $result, $action, $args ) {
         'requires_php' => '7.4',
         'sections'     => [
             'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.3.5</h4><p>En la pestaña Código personalizado, cada snippet ahora se puede plegar y desplegar (como un desplegable/acordeón), en vez de mostrarse siempre abierto con todo el código a la vista. Los snippets que ya tienen código guardado arrancan plegados para que la pantalla no se sature si hay varios; un bloque vacío se muestra abierto, listo para escribir. Con más de un snippet aparece también un enlace para expandir o contraer todos a la vez.</p><h4>1.3.4</h4><p><strong>Corrección:</strong> el módulo Duplicar seguía sin funcionar bien en páginas de Elementor en algunos hostings: la copia se abría en el editor de Elementor pero con todo el contenido metido en un único bloque de texto, como si Elementor no reconociera su estructura interna. Causa real: al copiar los metadatos de la página, WordPress devolvía una versión recortada de la estructura interna de Elementor (probablemente por algún filtro o caché de terceros propio de ese hosting), y esa versión incompleta era la que se guardaba en la copia. Ahora esos metadatos se copian leyendo y escribiendo directamente en la base de datos, evitando cualquier filtro que pueda alterarlos por el camino. Si duplicar páginas de Elementor te seguía dando problemas tras la 1.3.1, esta versión lo soluciona.</p><h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
+            'changelog'   => '<h4>1.3.6</h4><p>OneStep pasa a colgarse del menú compartido "Caracool" en vez de tener su propia entrada en la barra lateral: si en la web hay instalado más de un plugin de la casa (Motion, Carta, Churra), todos aparecen agrupados bajo "Caracool", con una portada que lista los que están puestos y su versión. El enlace y la URL de ajustes de OneStep no cambian, así que no se rompe ningún acceso guardado.</p><h4>1.3.5</h4><p>En la pestaña Código personalizado, cada snippet ahora se puede plegar y desplegar (como un desplegable/acordeón), en vez de mostrarse siempre abierto con todo el código a la vista. Los snippets que ya tienen código guardado arrancan plegados para que la pantalla no se sature si hay varios; un bloque vacío se muestra abierto, listo para escribir. Con más de un snippet aparece también un enlace para expandir o contraer todos a la vez.</p><h4>1.3.4</h4><p><strong>Corrección:</strong> el módulo Duplicar seguía sin funcionar bien en páginas de Elementor en algunos hostings: la copia se abría en el editor de Elementor pero con todo el contenido metido en un único bloque de texto, como si Elementor no reconociera su estructura interna. Causa real: al copiar los metadatos de la página, WordPress devolvía una versión recortada de la estructura interna de Elementor (probablemente por algún filtro o caché de terceros propio de ese hosting), y esa versión incompleta era la que se guardaba en la copia. Ahora esos metadatos se copian leyendo y escribiendo directamente en la base de datos, evitando cualquier filtro que pueda alterarlos por el camino. Si duplicar páginas de Elementor te seguía dando problemas tras la 1.3.1, esta versión lo soluciona.</p><h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
         ],
     ];
 }, 10, 3 );
