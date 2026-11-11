@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
- * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer y permite duplicar páginas y entradas. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.3.7
+ * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
+ * Version:     1.4.4
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.3.7' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.4.4' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -20,6 +20,7 @@ define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
 // Menú compartido "Caracool" de todos los plugins de la casa (Motion, Carta,
 // OneStep, Churra): archivo idéntico en cada uno, ver inc/caracool-menu.php.
 require_once CARACOOL_ONESTEP_PATH . 'inc/caracool-menu.php';
+require_once CARACOOL_ONESTEP_PATH . 'inc/caracool-actualizador.php';
 
 // ─────────────────────────────────────────────────────────────
 // CLASE PRINCIPAL
@@ -27,6 +28,10 @@ require_once CARACOOL_ONESTEP_PATH . 'inc/caracool-menu.php';
 class Caracool_OneStep {
 
     const OPTION_KEY = 'caracool_onestep_settings';
+
+    /** Conexión con Claude: espacio de rutas REST y registro de cambios. */
+    const CLAUDE_NS      = 'caracool/v1';
+    const CLAUDE_LOG_KEY = 'caracool_onestep_claude_log';
 
     /** Roles WP ordenados de menor a mayor peso, para el bypass de mantenimiento. */
     const ROLE_ORDER = [ 'subscriber', 'contributor', 'author', 'editor', 'administrator' ];
@@ -62,6 +67,10 @@ class Caracool_OneStep {
         if ( ! empty( $settings['duplicate_enabled'] ) ) {
             $this->duplicate_bootstrap();
         }
+
+        if ( ! empty( $settings['claude_enabled'] ) ) {
+            $this->claude_bootstrap();
+        }
     }
 
     // ── Ajustes por defecto ───────────────────────────────────
@@ -92,6 +101,10 @@ class Caracool_OneStep {
             // Duplicar (páginas y entradas)
             'duplicate_enabled'      => false,
             'duplicate_title_prefix' => 'Copia de ',
+
+            // Conexión con Claude
+            'claude_enabled' => false,
+            'claude_user_id' => 0,
         ] );
     }
 
@@ -124,6 +137,9 @@ class Caracool_OneStep {
             $status = absint( $_POST['maintenance_http_status'] ?? 503 );
             if ( ! in_array( $status, [ 200, 503, 404, 301 ], true ) ) $status = 503;
 
+            $claude_user = absint( $_POST['claude_user_id'] ?? 0 );
+            if ( $claude_user && ! user_can( $claude_user, 'edit_pages' ) ) $claude_user = 0;
+
             $bypass_role = sanitize_text_field( $_POST['maintenance_bypass_role'] ?? '' );
             if ( $bypass_role && ! in_array( $bypass_role, self::ROLE_ORDER, true ) ) $bypass_role = '';
 
@@ -147,6 +163,9 @@ class Caracool_OneStep {
 
                 'duplicate_enabled'           => ! empty( $_POST['duplicate_enabled'] ),
                 'duplicate_title_prefix'      => sanitize_text_field( wp_unslash( $_POST['duplicate_title_prefix'] ?? '' ) ),
+
+                'claude_enabled'              => ! empty( $_POST['claude_enabled'] ),
+                'claude_user_id'              => $claude_user,
             ];
         }
 
@@ -159,7 +178,7 @@ class Caracool_OneStep {
             $active_tab = 'tab-codigo';
         } else {
             $posted_tab = sanitize_key( wp_unslash( $_POST['co_active_tab'] ?? '' ) );
-            $active_tab = in_array( $posted_tab, [ 'tab-comentarios', 'tab-mantenimiento', 'tab-duplicar' ], true ) ? $posted_tab : 'tab-comentarios';
+            $active_tab = in_array( $posted_tab, [ 'tab-comentarios', 'tab-mantenimiento', 'tab-duplicar', 'tab-claude' ], true ) ? $posted_tab : 'tab-comentarios';
         }
 
         wp_safe_redirect( admin_url( 'admin.php?page=' . CARACOOL_ONESTEP_SLUG . '&saved=1&tab=' . $active_tab ) );
@@ -250,7 +269,7 @@ class Caracool_OneStep {
             'nombre'  => 'OneStep',
             'pagina'  => CARACOOL_ONESTEP_SLUG,
             'version' => CARACOOL_ONESTEP_VERSION,
-            'resumen' => 'Comentarios, mantenimiento y código personalizado',
+            'resumen' => 'Comentarios, mantenimiento, código personalizado y conexión con Claude',
         ];
         return $lista;
     }
@@ -270,9 +289,9 @@ class Caracool_OneStep {
 
         // Qué pestaña mostrar activa al cargar: la que venga en la URL tras
         // guardar (ver save_settings()), o "Comentarios" por defecto.
-        $co_valid_tabs = [ 'tab-comentarios', 'tab-mantenimiento', 'tab-codigo', 'tab-duplicar' ];
+        $co_valid_tabs = [ 'tab-comentarios', 'tab-mantenimiento', 'tab-codigo', 'tab-duplicar', 'tab-claude' ];
         $active_tab    = isset( $_GET['tab'] ) && in_array( $_GET['tab'], $co_valid_tabs, true ) ? sanitize_key( $_GET['tab'] ) : 'tab-comentarios';
-        $co_main_tab   = in_array( $active_tab, [ 'tab-mantenimiento', 'tab-duplicar' ], true ) ? $active_tab : 'tab-comentarios'; // valor inicial del campo oculto del form principal
+        $co_main_tab   = in_array( $active_tab, [ 'tab-mantenimiento', 'tab-duplicar', 'tab-claude' ], true ) ? $active_tab : 'tab-comentarios'; // valor inicial del campo oculto del form principal
         ?>
         <div class="wrap co-wrap">
         <style>
@@ -388,7 +407,7 @@ class Caracool_OneStep {
                 <?php echo self::logo_svg(); // phpcs:ignore -- markup fijo, sin datos de usuario ?>
                 <div class="co-head-titles">
                     <h1>OneStep <span class="co-ver-pill">v<?php echo esc_html( CARACOOL_ONESTEP_VERSION ); ?></span></h1>
-                    <p class="co-head-sub">Comentarios, mantenimiento y código personalizado — un plugin, sin dependencias</p>
+                    <p class="co-head-sub">Comentarios, mantenimiento, código personalizado y conexión con Claude — un plugin, sin dependencias</p>
                 </div>
             </div>
             <div class="co-status-chip"><span class="co-dot"></span>Activo</div>
@@ -410,6 +429,10 @@ class Caracool_OneStep {
             <button type="button" class="co-tab <?php echo 'tab-duplicar' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-duplicar">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 Duplicar
+            </button>
+            <button type="button" class="co-tab <?php echo 'tab-claude' === $active_tab ? 'active' : ''; ?>" data-co-tab="tab-claude">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Claude
             </button>
         </div>
 
@@ -608,6 +631,84 @@ class Caracool_OneStep {
                         <p class="co-field-hint" style="margin-top:16px;">WPML detectado: la copia se etiqueta con el mismo idioma que el original, para que no aparezca en el idioma por defecto del sitio por error. No se duplican las demás traducciones — solo el idioma que estás viendo.</p>
                         <?php endif; ?>
                     </div>
+
+                    <div class="co-btn-row">
+                        <button type="submit" class="co-btn co-btn-primary">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            Guardar configuración
+                        </button>
+                    </div>
+                </div>
+
+                <!-- ── TAB: CLAUDE ── -->
+                <?php
+                $co_claude_users = get_users( [ 'capability' => 'edit_pages', 'orderby' => 'login', 'fields' => [ 'ID', 'user_login', 'display_name' ] ] );
+                $co_claude_user  = $s['claude_user_id'] ? get_userdata( (int) $s['claude_user_id'] ) : null;
+                $co_claude_log   = array_slice( (array) get_option( self::CLAUDE_LOG_KEY, [] ), 0, 10 );
+                $co_app_pw_ok    = function_exists( 'wp_is_application_passwords_available' ) && wp_is_application_passwords_available();
+                ?>
+                <div id="tab-claude" class="co-tab-panel co-panel <?php echo 'tab-claude' === $active_tab ? 'active' : ''; ?>">
+                    <div class="co-card">
+                        <div class="co-card-head">
+                            <div class="co-card-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                            <h2>Conexión con Claude</h2>
+                        </div>
+                        <div class="co-toggle-row">
+                            <div>
+                                <div class="co-label">Dejar que Claude edite las páginas de Elementor</div>
+                                <p class="co-hint">Claude lee y guarda páginas de Elementor por la API de WordPress, sin que nadie tenga que tener la sesión abierta. Entra con una contraseña de aplicación de un único usuario, el que elijas abajo, y solo toca lo que ese usuario ya puede editar. Antes de cada guardado deja una revisión, y no guarda si alguien ha cambiado la página después de que Claude la leyera o si la tiene abierta en el editor. Apagado, no añade nada a la web.</p>
+                            </div>
+                            <label class="co-switch">
+                                <input type="checkbox" name="claude_enabled" value="1" <?php checked( $s['claude_enabled'] ); ?>>
+                                <span class="co-track"></span>
+                            </label>
+                        </div>
+
+                        <div class="co-field-grid">
+                            <label for="claude_user_id">Usuario de Claude</label>
+                            <select name="claude_user_id" id="claude_user_id">
+                                <option value="0">— Elige un usuario —</option>
+                                <?php foreach ( $co_claude_users as $co_u ) : ?>
+                                    <option value="<?php echo (int) $co_u->ID; ?>" <?php selected( (int) $s['claude_user_id'], (int) $co_u->ID ); ?>><?php echo esc_html( $co_u->display_name . ' (' . $co_u->user_login . ')' ); ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <p class="co-field-hint">Mejor un usuario solo para esto (por ejemplo «claude», con rol Editor), para que en el historial se vea qué cambió Claude y poder cortarle el acceso sin tocar a nadie más.</p>
+                        </div>
+
+                        <?php if ( ! $co_app_pw_ok ) : ?>
+                            <p class="co-field-hint" style="margin-top:16px;color:#b42318;">⚠️ Las contraseñas de aplicación están desactivadas en esta web (las desactiva algún plugin de seguridad, o la web no va por HTTPS). Sin ellas Claude no puede conectarse.</p>
+                        <?php elseif ( $co_claude_user ) : ?>
+                            <p class="co-field-hint" style="margin-top:16px;">
+                                Siguiente paso: <a href="<?php echo esc_url( admin_url( 'user-edit.php?user_id=' . (int) $co_claude_user->ID ) . '#application-passwords-section' ); ?>">crea una contraseña de aplicación para <?php echo esc_html( $co_claude_user->user_login ); ?></a> (llámala «Claude») y guárdala en el llavero del Mac. Se puede revocar desde ahí en cualquier momento.
+                            </p>
+                        <?php endif; ?>
+
+                        <p class="co-field-hint" style="margin-top:12px;">Dirección de la conexión: <code><?php echo esc_html( rest_url( self::CLAUDE_NS . '/' ) ); ?></code>. Si al probarla responde 401 con la contraseña bien puesta, el hosting está quitando la cabecera <code>Authorization</code>: hay que dejarla pasar en el <code>.htaccess</code>.</p>
+                        <p class="co-field-hint" style="margin-top:12px;"><?php echo defined( 'CARACOOL_MOTION_VERSION' )
+                            ? 'Caracool Motion está activo (v' . esc_html( CARACOOL_MOTION_VERSION ) . '): Claude puede usar sus efectos de movimiento.'
+                            : 'Esta web no tiene Caracool Motion: Claude no usará efectos de movimiento ni ajustes de Motion.'; ?></p>
+                    </div>
+
+                    <?php if ( $co_claude_log ) : ?>
+                    <div class="co-card">
+                        <div class="co-card-head"><h2>Últimos cambios de Claude</h2></div>
+                        <table class="widefat striped" style="margin-top:8px;">
+                            <thead><tr><th>Fecha</th><th>Qué</th><th>Página</th><th>Detalle</th></tr></thead>
+                            <tbody>
+                            <?php foreach ( $co_claude_log as $co_l ) : ?>
+                                <tr>
+                                    <td><?php echo esc_html( $co_l['fecha'] ?? '' ); ?></td>
+                                    <td><?php echo esc_html( $co_l['accion'] ?? '' ); ?></td>
+                                    <td><?php if ( ! empty( $co_l['post'] ) ) : ?><a href="<?php echo esc_url( get_edit_post_link( (int) $co_l['post'] ) ?: '#' ); ?>"><?php echo esc_html( ( $co_l['titulo'] ?? '' ) ?: '#' . (int) $co_l['post'] ); ?></a><?php endif; ?></td>
+                                    <td><?php echo esc_html( $co_l['detalle'] ?? '' ); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    <?php endif; ?>
 
                     <div class="co-btn-row">
                         <button type="submit" class="co-btn co-btn-primary">
@@ -1657,6 +1758,861 @@ class Caracool_OneStep {
             'source_language_code' => null,
         ] );
     }
+
+    // ─────────────────────────────────────────────────────────
+    // MÓDULO: CONEXIÓN CON CLAUDE (nuevo en 1.4.0)
+    // ─────────────────────────────────────────────────────────
+    // Endpoints REST bajo /wp-json/caracool/v1/ para que Claude lea y edite
+    // páginas de Elementor sin tener la sesión de nadie abierta en un
+    // navegador. Se autentica con una contraseña de aplicación de WordPress
+    // (Usuarios → Perfil), de un único usuario elegido en la pestaña Claude.
+    //
+    // Reglas que el módulo hace cumplir por código, no por buena voluntad:
+    // - Solo el usuario elegido puede usarlo, y solo en lo que ese usuario
+    //   ya puede editar (edit_post).
+    // - Para guardar hay que mandar la "version" (huella del _elementor_data)
+    //   que se leyó. Si alguien ha guardado después, se rechaza con 409 en
+    //   vez de pisarle el trabajo.
+    // - Si alguien tiene la página abierta en el editor ahora mismo, se
+    //   rechaza con 423 salvo que se pida "forzar".
+    // - Antes de cada guardado se crea una revisión, que se puede restaurar.
+    // - Se guarda con Document::save() de Elementor, igual que el botón
+    //   Guardar del editor: regenera el CSS y vacía la caché de elementos.
+    // Con el módulo apagado no se registra ni una ruta.
+
+    private function claude_bootstrap() {
+        self::claude_cabecera_alternativa();
+        add_action( 'rest_api_init', [ $this, 'claude_register_routes' ] );
+    }
+
+    /**
+     * Muchos hostings (Plesk, FastCGI) no pasan la cabecera Authorization a
+     * PHP, y entonces WordPress no ve la contraseña de aplicación: responde
+     * «no estás conectado» aunque sea correcta. Caso real: caracool.net.
+     * Como no hay acceso al .htaccess, el MCP manda la misma credencial
+     * también en X-Caracool-Auth, que sí llega, y aquí se copia donde
+     * WordPress la busca. Solo en las rutas caracool/v1, solo con el módulo
+     * encendido y solo si Authorization no ha llegado. La credencial la
+     * sigue comprobando WordPress como siempre.
+     */
+    public static function claude_cabecera_alternativa() {
+        if ( ! empty( $_SERVER['PHP_AUTH_USER'] ) || ! empty( $_SERVER['HTTP_AUTHORIZATION'] ) ) return;
+        $h = isset( $_SERVER['HTTP_X_CARACOOL_AUTH'] ) ? (string) $_SERVER['HTTP_X_CARACOOL_AUTH'] : '';
+        if ( 0 !== stripos( $h, 'Basic ' ) ) return;
+        $uri = rawurldecode( (string) ( $_SERVER['REQUEST_URI'] ?? '' ) );
+        if ( false === strpos( $uri, '/' . self::CLAUDE_NS . '/' ) ) return;
+        $dec = base64_decode( substr( $h, 6 ), true );
+        if ( false === $dec || false === strpos( $dec, ':' ) ) return;
+        list( $usuario, $clave ) = explode( ':', $dec, 2 );
+        $_SERVER['PHP_AUTH_USER'] = $usuario;
+        $_SERVER['PHP_AUTH_PW']   = $clave;
+    }
+
+    public function claude_register_routes() {
+        $ns   = self::CLAUDE_NS;
+        $perm = [ $this, 'claude_permission' ];
+
+        register_rest_route( $ns, '/estado', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_estado' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/registro', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_ver_registro' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/paginas', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_crear_pagina' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/motion', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_motion' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/elementor/kit', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_kit' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/elementor/cache', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_limpiar_cache' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/elementor/(?P<id>\d+)', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_leer' ],    'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_guardar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/elementor/(?P<id>\d+)/elemento/(?P<el>[A-Za-z0-9]+)', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_leer_elemento' ],    'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_ajustar_elemento' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/elementor/(?P<id>\d+)/revisiones', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_revisiones' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/elementor/(?P<id>\d+)/revisiones/(?P<rev>\d+)', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_restaurar' ], 'permission_callback' => $perm,
+        ] );
+    }
+
+    /**
+     * Comprueba la contraseña de aplicación aquí mismo, con la función de
+     * WordPress, si WordPress no lo ha hecho ya. Caso real (caracool.net,
+     * 1.4.1): ni con una contraseña falsa respondía «contraseña incorrecta»,
+     * señal de que el usuario actual se había decidido antes de que
+     * WordPress supiera que era una petición REST (algún plugin pregunta
+     * por el usuario demasiado pronto) y la contraseña no se llegaba a
+     * mirar. Aquí, ya dentro de la REST, se valida y se fija el usuario.
+     * Lee Authorization (ya traducida por PHP o en HTTP_AUTHORIZATION) o,
+     * si el hosting la quita, X-Caracool-Auth.
+     */
+    public static function claude_autenticar() {
+        $usuario = isset( $_SERVER['PHP_AUTH_USER'] ) ? (string) $_SERVER['PHP_AUTH_USER'] : '';
+        $clave   = isset( $_SERVER['PHP_AUTH_PW'] ) ? (string) $_SERVER['PHP_AUTH_PW'] : '';
+        if ( '' === $usuario ) {
+            foreach ( [ 'HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION', 'HTTP_X_CARACOOL_AUTH' ] as $k ) {
+                $h = isset( $_SERVER[ $k ] ) ? (string) $_SERVER[ $k ] : '';
+                if ( 0 !== stripos( $h, 'Basic ' ) ) continue;
+                $dec = base64_decode( substr( $h, 6 ), true );
+                if ( false === $dec || false === strpos( $dec, ':' ) ) continue;
+                list( $usuario, $clave ) = explode( ':', $dec, 2 );
+                break;
+            }
+        }
+        if ( '' === $usuario ) {
+            return new \WP_Error( 'co_sin_credencial', 'No ha llegado ninguna credencial a WordPress (ni Authorization ni X-Caracool-Auth).', [ 'status' => 401 ] );
+        }
+        if ( ! function_exists( 'wp_authenticate_application_password' ) ) {
+            return new \WP_Error( 'co_sin_app_passwords', 'Este WordPress no tiene contraseñas de aplicación.', [ 'status' => 401 ] );
+        }
+        $user = wp_authenticate_application_password( null, $usuario, $clave );
+        if ( $user instanceof \WP_User ) {
+            wp_set_current_user( $user->ID );
+            return $user;
+        }
+        if ( is_wp_error( $user ) ) {
+            return new \WP_Error( 'co_credencial', 'WordPress rechaza la contraseña de aplicación de «' . $usuario . '» (' . $user->get_error_code() . ').', [ 'status' => 401 ] );
+        }
+        return new \WP_Error( 'co_credencial', 'WordPress no ha validado la contraseña de aplicación (¿están desactivadas para este usuario o para la API?).', [ 'status' => 401 ] );
+    }
+
+    /** Solo el usuario elegido en la pestaña Claude, y con permiso de editar páginas. */
+    public function claude_permission() {
+        if ( ! is_user_logged_in() ) {
+            $autenticado = self::claude_autenticar();
+            if ( is_wp_error( $autenticado ) ) return $autenticado;
+        }
+        $uid = (int) $this->get_settings()['claude_user_id'];
+        if ( ! $uid ) {
+            return new \WP_Error( 'co_sin_usuario', 'Falta elegir el usuario de Claude en Caracool → OneStep → Claude.', [ 'status' => 403 ] );
+        }
+        if ( get_current_user_id() !== $uid ) {
+            return new \WP_Error( 'co_usuario', 'Este usuario no tiene permitida la conexión con Claude.', [ 'status' => 403 ] );
+        }
+        if ( ! current_user_can( 'edit_pages' ) ) {
+            return new \WP_Error( 'co_permiso', 'El usuario de Claude no puede editar páginas.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    // ── Lecturas ──────────────────────────────────────────────
+
+    public function claude_estado() {
+        $idiomas = null;
+        if ( defined( 'ICL_SITEPRESS_VERSION' ) ) {
+            $idiomas = array_keys( (array) apply_filters( 'wpml_active_languages', null, [ 'skip_missing' => 0 ] ) );
+        }
+        return [
+            'web'           => home_url( '/' ),
+            'onestep'       => CARACOOL_ONESTEP_VERSION,
+            'wordpress'     => get_bloginfo( 'version' ),
+            'elementor'     => defined( 'ELEMENTOR_VERSION' ) ? ELEMENTOR_VERSION : null,
+            'elementor_pro' => defined( 'ELEMENTOR_PRO_VERSION' ) ? ELEMENTOR_PRO_VERSION : null,
+            'wpml'          => defined( 'ICL_SITEPRESS_VERSION' ) ? ICL_SITEPRESS_VERSION : null,
+            // Caracool Motion no está en todas las webs: null = no hay efectos de movimiento.
+            'motion'        => $this->claude_hay_motion() ? CARACOOL_MOTION_VERSION : null,
+            'idiomas'       => $idiomas,
+            'idioma_defecto'=> $idiomas ? apply_filters( 'wpml_default_language', null ) : null,
+            'usuario'       => wp_get_current_user()->user_login,
+        ];
+    }
+
+    public function claude_ver_registro() {
+        return array_slice( (array) get_option( self::CLAUDE_LOG_KEY, [] ), 0, 50 );
+    }
+
+    /** GET /elementor/{id}: resumen del árbol (o el árbol entero con ?completo=1) y su "version". */
+    public function claude_leer( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+
+        $raw   = $this->claude_datos_crudos( $id );
+        $arbol = $this->claude_arbol( $raw );
+        $lock  = $this->claude_bloqueo( $id );
+
+        return [
+            'id'            => $id,
+            'titulo'        => $post->post_title,
+            'tipo'          => $post->post_type,
+            'estado'        => $post->post_status,
+            'url'           => get_permalink( $id ),
+            'idioma'        => $this->claude_idioma( $id, $post->post_type ),
+            'modificada'    => $post->post_modified,
+            'con_elementor' => 'builder' === get_post_meta( $id, '_elementor_edit_mode', true ),
+            'bloqueada_por' => $lock ? $lock->display_name : null,
+            'version'       => $this->claude_huella( $raw ),
+            'motion'        => $this->claude_hay_motion(),
+            'avisos'        => self::claude_avisos( $arbol, $this->claude_hay_motion() ),
+            'elementos'     => $request->get_param( 'completo' ) ? $arbol : self::claude_resumen( $arbol ),
+        ];
+    }
+
+    /**
+     * GET /motion: catálogo de Caracool Motion EN ESTA WEB (efectos de
+     * contenedor con sus controles cm_, y variantes de botón). Motion no
+     * está en todas las webs: si no está, lo dice y no hay que usar ningún
+     * ajuste cm_ ni proponer efectos de movimiento.
+     */
+    public function claude_motion() {
+        if ( ! $this->claude_hay_motion() ) {
+            return [
+                'motion' => null,
+                'aviso'  => 'Esta web no tiene Caracool Motion. No hay efectos de movimiento: no uses ajustes cm_ ni propongas cortinas, entradas ni parallax.',
+            ];
+        }
+        $out = [ 'motion' => CARACOOL_MOTION_VERSION, 'efectos' => null, 'botones' => null ];
+
+        if ( class_exists( 'Caracool_Motion_Scroll' ) && method_exists( 'Caracool_Motion_Scroll', 'efectos' ) ) {
+            $opciones = method_exists( 'Caracool_Motion_Scroll', 'opciones' ) ? (array) Caracool_Motion_Scroll::opciones() : [];
+            $efectos  = [];
+            foreach ( (array) Caracool_Motion_Scroll::efectos() as $clave => $fx ) {
+                $ops = [];
+                foreach ( (array) ( $fx['opciones'] ?? [] ) as $op ) {
+                    $def   = (array) ( $opciones[ $op ] ?? [] );
+                    $ops[] = array_filter( [
+                        'control'  => 'cm_' . $op,
+                        'etiqueta' => $def['etiqueta'] ?? $op,
+                        'tipo'     => $def['tipo'] ?? 'select',
+                        'valores'  => isset( $def['valores'] ) ? array_keys( (array) $def['valores'] ) : null,
+                        'defecto'  => $def['defecto'] ?? null,
+                        'min'      => $def['min'] ?? null,
+                        'max'      => $def['max'] ?? null,
+                    ], function ( $v ) { return null !== $v; } );
+                }
+                $efectos[] = [
+                    'clave'    => $clave,
+                    'etiqueta' => $fx['etiqueta'] ?? $clave,
+                    'ayuda'    => $fx['ayuda'] ?? '',
+                    'scroll'   => ! empty( $fx['scroll'] ),
+                    'opciones' => $ops,
+                ];
+            }
+            $out['efectos'] = [
+                'donde'   => 'Solo en contenedores: ajuste "cm_efecto" con la clave del efecto, y sus opciones con el control indicado. Los colores, enlazados a globales en __globals__.',
+                'lista'   => $efectos,
+            ];
+        }
+        if ( class_exists( 'Caracool_Motion_Botones' ) && method_exists( 'Caracool_Motion_Botones', 'variantes' ) ) {
+            $out['botones'] = [
+                'donde'     => 'El barrido de color de los botones se enciende para toda la web en Caracool → Motion, no botón a botón. Cada botón necesita sus dos colores enlazados a globales.',
+                'variantes' => array_keys( (array) Caracool_Motion_Botones::variantes() ),
+            ];
+        }
+        return $out;
+    }
+
+    /** Si esta web tiene Caracool Motion activo. */
+    private function claude_hay_motion() {
+        return defined( 'CARACOOL_MOTION_VERSION' );
+    }
+
+    /** GET /elementor/{id}/elemento/{el}: un elemento con todos sus ajustes. */
+    public function claude_leer_elemento( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+
+        $raw = $this->claude_datos_crudos( $id );
+        $el  = self::claude_encontrar( $this->claude_arbol( $raw ), (string) $request['el'] );
+        if ( null === $el ) {
+            return new \WP_Error( 'co_no_elemento', 'No hay ningún elemento con ese id en la página.', [ 'status' => 404 ] );
+        }
+        $hijos = [];
+        foreach ( (array) ( $el['elements'] ?? [] ) as $hijo ) $hijos[] = $hijo['id'] ?? '';
+        unset( $el['elements'] );
+        $el['hijos'] = $hijos;
+
+        return [ 'version' => $this->claude_huella( $raw ), 'elemento' => $el ];
+    }
+
+    /** GET /elementor/kit: colores, tipografías y puntos de interrupción del Kit activo. */
+    public function claude_kit() {
+        if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
+
+        $km  = \Elementor\Plugin::$instance->kits_manager;
+        $kit = method_exists( $km, 'get_active_kit_for_frontend' ) ? $km->get_active_kit_for_frontend() : $km->get_active_kit();
+        if ( ! $kit ) return new \WP_Error( 'co_sin_kit', 'No hay Kit activo.', [ 'status' => 404 ] );
+
+        $s = (array) $kit->get_settings();
+        $colores = [];
+        foreach ( array_merge( (array) ( $s['system_colors'] ?? [] ), (array) ( $s['custom_colors'] ?? [] ) ) as $c ) {
+            $colores[] = [ 'id' => $c['_id'] ?? '', 'nombre' => $c['title'] ?? '', 'color' => $c['color'] ?? '' ];
+        }
+        $tipos = [];
+        foreach ( array_merge( (array) ( $s['system_typography'] ?? [] ), (array) ( $s['custom_typography'] ?? [] ) ) as $t ) {
+            $tipos[] = [
+                'id'     => $t['_id'] ?? '',
+                'nombre' => $t['title'] ?? '',
+                'fuente' => $t['typography_font_family'] ?? '',
+                'peso'   => $t['typography_font_weight'] ?? '',
+            ];
+        }
+        return [
+            'kit'         => $kit->get_id(),
+            'colores'     => $colores,
+            'tipografias' => $tipos,
+            'puntos'      => $s['active_breakpoints'] ?? null,
+            'como_enlazar'=> 'En __globals__ de un elemento: "globals/colors?id=<id>" y, para tipografía, la clave typography_typography con "globals/typography?id=<id>".',
+        ];
+    }
+
+    public function claude_revisiones( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+
+        $out = [];
+        foreach ( wp_get_post_revisions( $id, [ 'posts_per_page' => 20 ] ) as $rev ) {
+            $autor = get_userdata( $rev->post_author );
+            $out[] = [ 'id' => $rev->ID, 'fecha' => $rev->post_modified, 'autor' => $autor ? $autor->display_name : '' ];
+        }
+        return $out;
+    }
+
+    // ── Escrituras ────────────────────────────────────────────
+
+    /** POST /elementor/{id}: guarda el árbol entero. Body: elements, version, [estado], [forzar]. */
+    public function claude_guardar( \WP_REST_Request $request ) {
+        $id  = (int) $request['id'];
+        $raw = $this->claude_comprobar_escritura( $id, $request );
+        if ( is_wp_error( $raw ) ) return $raw;
+
+        $elements = $request->get_param( 'elements' );
+        $error    = is_array( $elements ) ? self::claude_validar_arbol( $elements ) : 'Falta "elements" (el árbol de Elementor, un array).';
+        if ( $error ) return new \WP_Error( 'co_arbol', $error, [ 'status' => 400 ] );
+
+        $estado = (string) $request->get_param( 'estado' );
+        if ( $estado && ! in_array( $estado, [ 'publish', 'draft', 'private', 'pending' ], true ) ) {
+            return new \WP_Error( 'co_estado', 'Estado no válido: publish, draft, private o pending.', [ 'status' => 400 ] );
+        }
+
+        $resultado = $this->claude_guardar_documento( $id, $elements, $estado );
+        if ( is_wp_error( $resultado ) ) return $resultado;
+
+        $this->claude_registrar( 'guardar', $id, count( $elements ) . ' elementos de primer nivel' );
+        return $resultado;
+    }
+
+    /** POST /elementor/{id}/elemento/{el}: cambia ajustes de un elemento. Un valor null borra la clave. */
+    public function claude_ajustar_elemento( \WP_REST_Request $request ) {
+        $id  = (int) $request['id'];
+        $raw = $this->claude_comprobar_escritura( $id, $request );
+        if ( is_wp_error( $raw ) ) return $raw;
+
+        $settings = $request->get_param( 'settings' );
+        if ( ! is_array( $settings ) || ! $settings ) {
+            return new \WP_Error( 'co_settings', 'Falta "settings" (objeto con los ajustes que cambian).', [ 'status' => 400 ] );
+        }
+
+        $el_id = (string) $request['el'];
+        $hecho = false;
+        $arbol = self::claude_modificar( $this->claude_arbol( $raw ), $el_id, function ( $el ) use ( $settings ) {
+            $el['settings'] = self::claude_fusionar_ajustes( (array) ( $el['settings'] ?? [] ), $settings );
+            return $el;
+        }, $hecho );
+        if ( ! $hecho ) {
+            return new \WP_Error( 'co_no_elemento', 'No hay ningún elemento con ese id en la página.', [ 'status' => 404 ] );
+        }
+
+        $resultado = $this->claude_guardar_documento( $id, $arbol, '' );
+        if ( is_wp_error( $resultado ) ) return $resultado;
+
+        $this->claude_registrar( 'ajustar', $id, $el_id . ': ' . implode( ', ', array_keys( $settings ) ) );
+        return $resultado;
+    }
+
+    /**
+     * POST /paginas: crea una página ya lista para Elementor y, con WPML,
+     * con su idioma puesto (una página creada por la REST normal se queda
+     * sin idioma, da 404 y el editor de Elementor no carga nunca).
+     * Body: titulo, [slug], [estado=draft], [padre], [plantilla], [idioma],
+     * [traduccion_de] (id de la página original), [elements].
+     */
+    public function claude_crear_pagina( \WP_REST_Request $request ) {
+        if ( ! current_user_can( 'publish_pages' ) && 'draft' !== ( $request->get_param( 'estado' ) ?: 'draft' ) ) {
+            return new \WP_Error( 'co_permiso', 'Este usuario solo puede crear borradores.', [ 'status' => 403 ] );
+        }
+        $titulo = sanitize_text_field( (string) $request->get_param( 'titulo' ) );
+        if ( '' === $titulo ) return new \WP_Error( 'co_titulo', 'Falta "titulo".', [ 'status' => 400 ] );
+
+        $estado = (string) ( $request->get_param( 'estado' ) ?: 'draft' );
+        if ( ! in_array( $estado, [ 'publish', 'draft', 'private', 'pending' ], true ) ) $estado = 'draft';
+
+        $elements = $request->get_param( 'elements' );
+        if ( null !== $elements ) {
+            $error = is_array( $elements ) ? self::claude_validar_arbol( $elements ) : '"elements" tiene que ser un array.';
+            if ( $error ) return new \WP_Error( 'co_arbol', $error, [ 'status' => 400 ] );
+        }
+
+        $original = (int) $request->get_param( 'traduccion_de' );
+        if ( $original && ! current_user_can( 'edit_post', $original ) ) {
+            return new \WP_Error( 'co_permiso', 'No se puede leer la página original.', [ 'status' => 403 ] );
+        }
+
+        $id = wp_insert_post( [
+            'post_type'   => 'page',
+            'post_title'  => $titulo,
+            'post_name'   => sanitize_title( (string) $request->get_param( 'slug' ) ),
+            'post_status' => $estado,
+            'post_parent' => (int) $request->get_param( 'padre' ),
+        ], true );
+        if ( is_wp_error( $id ) ) return $id;
+
+        $plantilla = sanitize_text_field( (string) $request->get_param( 'plantilla' ) );
+        if ( $plantilla ) update_post_meta( $id, '_wp_page_template', $plantilla );
+
+        // Idioma de WPML, antes de que nadie abra la página.
+        $idioma = null;
+        if ( defined( 'ICL_SITEPRESS_VERSION' ) ) {
+            $idioma = sanitize_key( (string) $request->get_param( 'idioma' ) ) ?: apply_filters( 'wpml_default_language', null );
+            $trid   = null;
+            $origen = null;
+            if ( $original ) {
+                $det = apply_filters( 'wpml_element_language_details', null, [ 'element_id' => $original, 'element_type' => 'post_page' ] );
+                if ( $det && ! empty( $det->trid ) ) {
+                    $trid   = $det->trid;
+                    $origen = $det->language_code;
+                }
+            }
+            do_action( 'wpml_set_element_language_details', [
+                'element_id'           => $id,
+                'element_type'         => 'post_page',
+                'trid'                 => $trid,
+                'language_code'        => $idioma,
+                'source_language_code' => $origen,
+            ] );
+        }
+
+        $version = null;
+        $avisos  = [];
+        if ( $this->claude_elementor_listo() ) {
+            update_post_meta( $id, '_elementor_edit_mode', 'builder' );
+            update_post_meta( $id, '_elementor_template_type', 'wp-page' );
+            update_post_meta( $id, '_elementor_version', ELEMENTOR_VERSION );
+            if ( is_array( $elements ) && $elements ) {
+                $guardado = $this->claude_guardar_documento( $id, $elements, '', false );
+                if ( is_wp_error( $guardado ) ) return $guardado;
+                $version = $guardado['version'];
+                $avisos  = $guardado['avisos'];
+            } else {
+                update_post_meta( $id, '_elementor_data', '[]' );
+                $version = $this->claude_huella( '[]' );
+            }
+        }
+
+        $this->claude_registrar( 'crear', $id, $titulo . ( $idioma ? ' (' . $idioma . ')' : '' ) );
+        return [
+            'id'      => $id,
+            'url'     => get_permalink( $id ),
+            'estado'  => get_post_status( $id ),
+            'idioma'  => $idioma,
+            'version' => $version,
+            'avisos'  => $avisos,
+        ];
+    }
+
+    /**
+     * POST /elementor/{id}/revisiones/{rev}: vuelve los datos de Elementor
+     * de la página a los de una revisión. Body: version, [forzar].
+     *
+     * No usa wp_restore_post_revision(): en caracool.net (1.4.2) daba un
+     * error crítico junto con el gancho de restaurar de Elementor. Se lee el
+     * _elementor_data de la revisión directo de la tabla y se guarda por el
+     * mismo camino que cualquier cambio (revisión previa, CSS, caché, y las
+     * mismas comprobaciones de version y de editor abierto). Solo vuelve el
+     * diseño de Elementor: título, slug y estado de la página no cambian.
+     */
+    public function claude_restaurar( \WP_REST_Request $request ) {
+        $id  = (int) $request['id'];
+        $raw = $this->claude_comprobar_escritura( $id, $request );
+        if ( is_wp_error( $raw ) ) return $raw;
+
+        // wp_get_post_revision() recibe el id POR REFERENCIA: pasarle una
+        // expresión es un error fatal en PHP 8 (caso real, 1.4.2 y 1.4.3).
+        $rev_id = (int) $request['rev'];
+        $rev    = wp_get_post_revision( $rev_id );
+        if ( ! $rev || (int) $rev->post_parent !== $id ) {
+            return new \WP_Error( 'co_revision', 'Esa revisión no es de esta página.', [ 'status' => 404 ] );
+        }
+        $datos = $this->claude_arbol( $this->claude_datos_crudos( $rev->ID ) );
+        if ( ! $datos ) {
+            return new \WP_Error( 'co_revision', 'Esa revisión no guarda datos de Elementor.', [ 'status' => 404 ] );
+        }
+        $error = self::claude_validar_arbol( $datos );
+        if ( $error ) {
+            return new \WP_Error( 'co_revision', 'Los datos de esa revisión no son válidos: ' . $error, [ 'status' => 409 ] );
+        }
+
+        $resultado = $this->claude_guardar_documento( $id, $datos, '' );
+        if ( is_wp_error( $resultado ) ) return $resultado;
+
+        $this->claude_registrar( 'restaurar', $id, 'revisión ' . $rev->ID );
+        return $resultado;
+    }
+
+    /** POST /elementor/cache: lo mismo que Elementor → Herramientas → Regenerar archivos y datos. */
+    public function claude_limpiar_cache() {
+        if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
+        \Elementor\Plugin::$instance->files_manager->clear_cache();
+        delete_post_meta_by_key( '_elementor_element_cache' );
+        $this->claude_registrar( 'cache', 0, '' );
+        return [ 'ok' => true ];
+    }
+
+    // ── Piezas internas ───────────────────────────────────────
+
+    private function claude_elementor_listo() {
+        return class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance ) && defined( 'ELEMENTOR_VERSION' );
+    }
+
+    private function claude_sin_elementor() {
+        return new \WP_Error( 'co_sin_elementor', 'Elementor no está activo en esta web.', [ 'status' => 503 ] );
+    }
+
+    private function claude_post_editable( $id ) {
+        $post = get_post( $id );
+        if ( ! $post || 'revision' === $post->post_type ) {
+            return new \WP_Error( 'co_no_existe', 'No existe ningún contenido con ese id.', [ 'status' => 404 ] );
+        }
+        if ( ! current_user_can( 'edit_post', $id ) ) {
+            return new \WP_Error( 'co_permiso', 'El usuario de Claude no puede editar este contenido.', [ 'status' => 403 ] );
+        }
+        return $post;
+    }
+
+    /**
+     * Comprobaciones de cualquier guardado. Devuelve el _elementor_data
+     * actual (crudo) si se puede escribir, o el WP_Error que toque.
+     */
+    private function claude_comprobar_escritura( $id, \WP_REST_Request $request ) {
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+        if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
+
+        $lock = $this->claude_bloqueo( $id );
+        if ( $lock && ! $request->get_param( 'forzar' ) ) {
+            return new \WP_Error( 'co_bloqueada', sprintf( '%s tiene la página abierta en el editor ahora mismo. Espera a que la cierre.', $lock->display_name ), [ 'status' => 423 ] );
+        }
+
+        $raw      = $this->claude_datos_crudos( $id );
+        $actual   = $this->claude_huella( $raw );
+        $esperada = (string) $request->get_param( 'version' );
+        if ( '' === $esperada ) {
+            return new \WP_Error( 'co_sin_version', 'Falta "version": lee la página antes de guardar y manda la version que te dio.', [ 'status' => 428 ] );
+        }
+        if ( ! hash_equals( $actual, $esperada ) ) {
+            return new \WP_Error( 'co_cambiada', 'La página ha cambiado desde que la leíste (alguien ha guardado). Vuelve a leerla antes de guardar.', [ 'status' => 409, 'version' => $actual ] );
+        }
+        return $raw;
+    }
+
+    /** Usuario que tiene la página abierta en el editor ahora mismo (que no sea Claude), o null. */
+    private function claude_bloqueo( $id ) {
+        if ( ! function_exists( 'wp_check_post_lock' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/post.php';
+        }
+        $uid = wp_check_post_lock( $id );
+        return $uid ? get_userdata( $uid ) : null;
+    }
+
+    /**
+     * El _elementor_data tal cual está en la tabla. Se lee sin get_post_meta()
+     * por lo mismo que Duplicar (ver duplicate_create_copy()): en algún
+     * hosting la API devolvía el JSON recortado.
+     */
+    private function claude_datos_crudos( $id ) {
+        global $wpdb;
+        return (string) $wpdb->get_var( $wpdb->prepare(
+            "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_elementor_data' ORDER BY meta_id DESC LIMIT 1",
+            $id
+        ) );
+    }
+
+    private function claude_arbol( $raw ) {
+        $arbol = json_decode( (string) $raw, true );
+        return is_array( $arbol ) ? $arbol : [];
+    }
+
+    /** Huella corta del _elementor_data: es la "version" que se manda al guardar. */
+    private function claude_huella( $raw ) {
+        return substr( md5( (string) $raw ), 0, 16 );
+    }
+
+    private function claude_idioma( $id, $post_type ) {
+        if ( ! defined( 'ICL_SITEPRESS_VERSION' ) ) return null;
+        $det = apply_filters( 'wpml_element_language_details', null, [ 'element_id' => $id, 'element_type' => 'post_' . $post_type ] );
+        return $det && ! empty( $det->language_code ) ? $det->language_code : null;
+    }
+
+    /** Revisión de cómo está la página ahora, aunque WordPress crea que no ha cambiado nada. */
+    private function claude_crear_revision( $id ) {
+        if ( ! wp_revisions_enabled( get_post( $id ) ) ) return null;
+        add_filter( 'wp_save_post_revision_check_for_changes', '__return_false' );
+        $rev = wp_save_post_revision( $id );
+        remove_filter( 'wp_save_post_revision_check_for_changes', '__return_false' );
+        return $rev && ! is_wp_error( $rev ) ? (int) $rev : null;
+    }
+
+    /**
+     * Guarda con Document::save() de Elementor, como el botón Guardar del
+     * editor, y después vacía la caché de elementos y rehace el CSS de la
+     * página por si la versión de Elementor no lo hace sola.
+     */
+    private function claude_guardar_documento( $id, array $elements, $estado, $con_revision = true ) {
+        $doc = \Elementor\Plugin::$instance->documents->get( $id, false );
+        if ( ! $doc ) {
+            return new \WP_Error( 'co_documento', 'Elementor no reconoce este contenido como documento.', [ 'status' => 500 ] );
+        }
+        if ( ! $doc->is_editable_by_current_user() ) {
+            return new \WP_Error( 'co_permiso', 'Elementor no deja editar este contenido al usuario de Claude (revisa Elementor → Gestor de roles).', [ 'status' => 403 ] );
+        }
+
+        $revision = $con_revision ? $this->claude_crear_revision( $id ) : null;
+
+        $data = [ 'elements' => $elements ];
+        if ( $estado ) $data['settings'] = [ 'post_status' => $estado ];
+
+        try {
+            $ok = $doc->save( $data );
+        } catch ( \Throwable $e ) {
+            return new \WP_Error( 'co_guardar', 'Elementor ha dado un error al guardar: ' . $e->getMessage(), [ 'status' => 500 ] );
+        }
+        if ( ! $ok ) {
+            return new \WP_Error( 'co_guardar', 'Elementor no ha guardado la página.', [ 'status' => 500 ] );
+        }
+
+        $this->claude_refrescar( $id );
+
+        return [
+            'id'       => $id,
+            'version'  => $this->claude_huella( $this->claude_datos_crudos( $id ) ),
+            'avisos'   => self::claude_avisos( $elements, $this->claude_hay_motion() ),
+            'revision' => $revision,
+            'estado'   => get_post_status( $id ),
+            'url'      => get_permalink( $id ),
+        ];
+    }
+
+    /** Vacía la caché de elementos de la página y rehace su CSS. */
+    private function claude_refrescar( $id ) {
+        delete_post_meta( $id, '_elementor_element_cache' );
+        delete_post_meta( $id, '_elementor_css' );
+        wp_cache_delete( $id, 'post_meta' );
+        if ( class_exists( '\Elementor\Core\Files\CSS\Post' ) ) {
+            try {
+                ( new \Elementor\Core\Files\CSS\Post( $id ) )->update();
+            } catch ( \Throwable $e ) {
+                // Si falla, Elementor lo regenera solo en la primera visita.
+            }
+        }
+    }
+
+    private function claude_registrar( $accion, $post_id, $detalle ) {
+        $log = (array) get_option( self::CLAUDE_LOG_KEY, [] );
+        array_unshift( $log, [
+            'fecha'   => current_time( 'mysql' ),
+            'accion'  => $accion,
+            'post'    => (int) $post_id,
+            'titulo'  => $post_id ? get_the_title( $post_id ) : '',
+            'detalle' => mb_substr( (string) $detalle, 0, 200 ),
+        ] );
+        update_option( self::CLAUDE_LOG_KEY, array_slice( $log, 0, 50 ), false );
+    }
+
+    // ── Avisos de las reglas de construcción de la casa ──
+    // No bloquean el guardado: vuelven en la respuesta para que se corrijan.
+
+    /** Lista de avisos (frases cortas) sobre un árbol de Elementor. */
+    public static function claude_avisos( array $elements, $hay_motion ) {
+        $avisos = [];
+        $cm     = [];
+        $crece  = 0;
+        self::claude_revisar( $elements, $avisos, $cm, $crece );
+
+        if ( $cm && ! $hay_motion ) {
+            $avisos[] = 'Esta web no tiene Caracool Motion: los ajustes cm_ de ' . implode( ', ', array_slice( array_unique( $cm ), 0, 8 ) ) . ' no hacen nada. Quítalos.';
+        }
+        if ( $hay_motion && $crece > 1 ) {
+            $avisos[] = 'El efecto «crece» de Motion va una sola vez por página y aquí hay ' . $crece . '.';
+        }
+        $avisos = array_values( array_unique( $avisos ) );
+        if ( count( $avisos ) > 30 ) {
+            $resto  = count( $avisos ) - 30;
+            $avisos = array_slice( $avisos, 0, 30 );
+            $avisos[] = "… y $resto avisos más.";
+        }
+        return $avisos;
+    }
+
+    private static function claude_revisar( array $elements, array &$avisos, array &$cm, &$crece ) {
+        foreach ( $elements as $el ) {
+            if ( ! is_array( $el ) ) continue;
+            $id      = (string) ( $el['id'] ?? '?' );
+            $tipo    = $el['elType'] ?? '';
+            $widget  = $el['widgetType'] ?? '';
+            $s       = is_array( $el['settings'] ?? null ) ? $el['settings'] : [];
+            $globals = is_array( $s['__globals__'] ?? null ) ? $s['__globals__'] : [];
+
+            if ( 'section' === $tipo || 'column' === $tipo ) {
+                $avisos[] = "$id es una " . ( 'section' === $tipo ? 'sección' : 'columna' ) . ' antigua: la casa monta todo con contenedores flexbox.';
+            }
+            if ( 'html' === $widget ) {
+                $avisos[] = "$id es un widget HTML: no se usa para montar estructura.";
+            }
+            if ( ! empty( $s['custom_css'] ) ) {
+                $avisos[] = "$id lleva CSS personalizado: la casa no usa CSS a mano (colores y fuentes globales, Estilo del tema y ajustes del widget).";
+            }
+            if ( isset( $globals['typography'] ) ) {
+                $avisos[] = "$id enlaza la tipografía con la clave «typography»: en __globals__ es «typography_typography».";
+            }
+
+            foreach ( $s as $clave => $valor ) {
+                if ( 0 === strpos( (string) $clave, 'cm_' ) && '' !== $valor && null !== $valor ) {
+                    $cm[] = $id;
+                }
+                if ( preg_match( '/_color(_hover|_tablet|_mobile)?$/', (string) $clave ) && is_string( $valor ) && '' !== $valor && empty( $globals[ $clave ] ) ) {
+                    $avisos[] = "$id.$clave tiene un color escrito a mano ($valor): enlázalo a un color global del Kit.";
+                }
+                if ( preg_match( '/^(width|_element_custom_width)(_[a-z_]+)?$/', (string) $clave ) && is_array( $valor ) && ( $valor['unit'] ?? '' ) === 'px' && '' !== (string) ( $valor['size'] ?? '' ) ) {
+                    $avisos[] = "$id.$clave está en píxeles: la casa pone los anchos en porcentaje.";
+                }
+            }
+
+            if ( 'container' === $tipo && isset( $s['width'] ) && 'full' !== ( $s['content_width'] ?? 'boxed' ) ) {
+                $avisos[] = "$id es un contenedor «boxed» con ancho (width): ese ancho no se aplica. Ponlo a ancho completo (content_width: full).";
+            }
+            if ( 'button' === $widget ) {
+                $faltan = [];
+                foreach ( [ 'background_color' => 'fondo', 'button_text_color' => 'texto' ] as $c => $nombre ) {
+                    if ( empty( $globals[ $c ] ) ) $faltan[] = $nombre;
+                }
+                if ( $faltan ) {
+                    $avisos[] = "El botón $id no tiene enlazado a un global el color de " . implode( ' ni el de ', $faltan ) . ': si no, sale con el color de Énfasis y no hace caso al Kit.';
+                }
+            }
+            if ( 'crece' === ( $s['cm_efecto'] ?? '' ) ) {
+                $crece++;
+            }
+
+            if ( ! empty( $el['elements'] ) && is_array( $el['elements'] ) ) {
+                self::claude_revisar( $el['elements'], $avisos, $cm, $crece );
+            }
+        }
+    }
+
+    // ── Funciones puras sobre el árbol (probadas en pruebas/claude-arbol.php) ──
+
+    /** Árbol corto: id, tipo, widget y un trozo del texto, sin los ajustes. */
+    public static function claude_resumen( array $elements ) {
+        $out = [];
+        foreach ( $elements as $el ) {
+            if ( ! is_array( $el ) ) continue;
+            $item = [ 'id' => $el['id'] ?? '', 'tipo' => $el['elType'] ?? '' ];
+            if ( ! empty( $el['widgetType'] ) ) $item['widget'] = $el['widgetType'];
+            $texto = self::claude_texto_corto( (array) ( $el['settings'] ?? [] ) );
+            if ( '' !== $texto ) $item['texto'] = $texto;
+            if ( ! empty( $el['elements'] ) ) $item['hijos'] = self::claude_resumen( (array) $el['elements'] );
+            $out[] = $item;
+        }
+        return $out;
+    }
+
+    public static function claude_texto_corto( array $settings ) {
+        foreach ( [ 'title', 'editor', 'text', 'heading_title', 'title_text', 'description_text', 'button_text' ] as $k ) {
+            if ( isset( $settings[ $k ] ) && is_string( $settings[ $k ] ) && '' !== trim( $settings[ $k ] ) ) {
+                $t = trim( preg_replace( '/\s+/u', ' ', wp_strip_all_tags( $settings[ $k ] ) ) );
+                return mb_strlen( $t ) > 60 ? mb_substr( $t, 0, 60 ) . '…' : $t;
+            }
+        }
+        if ( ! empty( $settings['image']['url'] ) && is_string( $settings['image']['url'] ) ) {
+            return basename( $settings['image']['url'] );
+        }
+        return '';
+    }
+
+    public static function claude_encontrar( array $elements, $el_id ) {
+        foreach ( $elements as $el ) {
+            if ( ! is_array( $el ) ) continue;
+            if ( ( $el['id'] ?? '' ) === $el_id ) return $el;
+            if ( ! empty( $el['elements'] ) ) {
+                $hallado = self::claude_encontrar( (array) $el['elements'], $el_id );
+                if ( null !== $hallado ) return $hallado;
+            }
+        }
+        return null;
+    }
+
+    public static function claude_modificar( array $elements, $el_id, callable $fn, &$hecho ) {
+        foreach ( $elements as $i => $el ) {
+            if ( ! is_array( $el ) ) continue;
+            if ( ( $el['id'] ?? '' ) === $el_id ) {
+                $elements[ $i ] = $fn( $el );
+                $hecho = true;
+                return $elements;
+            }
+            if ( ! empty( $el['elements'] ) ) {
+                $elements[ $i ]['elements'] = self::claude_modificar( (array) $el['elements'], $el_id, $fn, $hecho );
+                if ( $hecho ) return $elements;
+            }
+        }
+        return $elements;
+    }
+
+    /**
+     * Mezcla ajustes: cada clave nueva sustituye a la vieja y un null la
+     * borra. __globals__ se mezcla clave a clave, para enlazar un color
+     * global sin perder los demás enlaces del elemento.
+     */
+    public static function claude_fusionar_ajustes( array $actuales, array $nuevos ) {
+        foreach ( $nuevos as $clave => $valor ) {
+            if ( null === $valor ) {
+                unset( $actuales[ $clave ] );
+            } elseif ( '__globals__' === $clave && is_array( $valor ) ) {
+                $globales = (array) ( $actuales['__globals__'] ?? [] );
+                foreach ( $valor as $g => $v ) {
+                    if ( null === $v ) unset( $globales[ $g ] ); else $globales[ $g ] = $v;
+                }
+                $actuales['__globals__'] = $globales;
+            } else {
+                $actuales[ $clave ] = $valor;
+            }
+        }
+        return $actuales;
+    }
+
+    /** Devuelve '' si el árbol es válido, o el motivo si no. */
+    public static function claude_validar_arbol( array $elements, array &$vistos = [], $nivel = 0 ) {
+        if ( $nivel > 30 ) return 'El árbol tiene demasiados niveles.';
+        foreach ( $elements as $i => $el ) {
+            if ( ! is_array( $el ) ) return "El elemento $i no es un objeto.";
+            $id = $el['id'] ?? '';
+            if ( ! is_string( $id ) || ! preg_match( '/^[A-Za-z0-9]{1,20}$/', $id ) ) return "Un elemento no tiene un id válido (posición $i, nivel $nivel).";
+            if ( isset( $vistos[ $id ] ) ) return "El id $id está repetido.";
+            $vistos[ $id ] = true;
+            $tipo = $el['elType'] ?? '';
+            if ( ! in_array( $tipo, [ 'container', 'section', 'column', 'widget' ], true ) ) return "El elemento $id tiene un elType desconocido.";
+            if ( 'widget' === $tipo && empty( $el['widgetType'] ) ) return "El widget $id no dice qué widget es (widgetType).";
+            if ( isset( $el['settings'] ) && ! is_array( $el['settings'] ) ) return "Los ajustes de $id no son un objeto.";
+            if ( ! empty( $el['elements'] ) ) {
+                if ( ! is_array( $el['elements'] ) ) return "Los hijos de $id no son un array.";
+                $error = self::claude_validar_arbol( $el['elements'], $vistos, $nivel + 1 );
+                if ( $error ) return $error;
+            }
+        }
+        return '';
+    }
 }
 
 new Caracool_OneStep();
@@ -1670,87 +2626,16 @@ add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), function ( $li
     return $links;
 } );
 
-// ── Update checker — GitHub Releases ──────────────────────────
-// Comprueba si hay nueva versión disponible en el repo público,
-// sin librerías externas. Ajustar el nombre del repo si cambia.
-add_filter( 'pre_set_site_transient_update_plugins', function ( $transient ) {
-    if ( empty( $transient->checked ) ) return $transient;
-
-    $plugin_file = plugin_basename( __FILE__ );
-    if ( ! isset( $transient->checked[ $plugin_file ] ) ) return $transient;
-
-    $cache_key = 'caracool_onestep_gh_release';
-    $release   = get_transient( $cache_key );
-
-    if ( false === $release ) {
-        $response = wp_remote_get(
-            'https://api.github.com/repos/caracoolnet/wp-onestep/releases/latest',
-            [
-                'timeout' => 10,
-                'headers' => [
-                    'Accept'     => 'application/vnd.github+json',
-                    'User-Agent' => 'WordPress/' . get_bloginfo( 'version' ) . '; ' . home_url(),
-                ],
-            ]
-        );
-
-        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
-            set_transient( $cache_key, [], 6 * HOUR_IN_SECONDS );
-            return $transient;
-        }
-
-        $release = json_decode( wp_remote_retrieve_body( $response ), true );
-        set_transient( $cache_key, $release ?: [], 6 * HOUR_IN_SECONDS );
-    }
-
-    if ( empty( $release['tag_name'] ) ) return $transient;
-
-    $latest = ltrim( $release['tag_name'], 'v' );
-    if ( ! version_compare( $latest, CARACOOL_ONESTEP_VERSION, '>' ) ) return $transient;
-
-    $zip_url = '';
-    foreach ( $release['assets'] ?? [] as $asset ) {
-        if ( str_ends_with( $asset['name'], '.zip' ) ) {
-            $zip_url = $asset['browser_download_url'];
-            break;
-        }
-    }
-    if ( ! $zip_url ) {
-        $zip_url = $release['zipball_url'] ?? '';
-    }
-
-    $transient->response[ $plugin_file ] = (object) [
-        'id'           => 'github.com/caracoolnet/wp-onestep',
-        'slug'         => 'caracool-onestep',
-        'plugin'       => $plugin_file,
-        'new_version'  => $latest,
-        'url'          => 'https://github.com/caracoolnet/wp-onestep',
-        'package'      => $zip_url,
-        'requires'     => '6.0',
-        'tested'       => '6.8',
-        'requires_php' => '7.4',
-    ];
-
-    return $transient;
-} );
-
-// Información de plugin en el lightbox de "Ver detalles"
-add_filter( 'plugins_api', function ( $result, $action, $args ) {
-    if ( 'plugin_information' !== $action ) return $result;
-    if ( ( $args->slug ?? '' ) !== 'caracool-onestep' ) return $result;
-
-    return (object) [
-        'name'         => 'Caracool OneStep',
-        'slug'         => 'caracool-onestep',
-        'version'      => CARACOOL_ONESTEP_VERSION,
-        'author'       => '<a href="https://caracool.net">Caracool</a>',
-        'homepage'     => 'https://github.com/caracoolnet/wp-onestep',
-        'requires'     => '6.0',
-        'tested'       => '6.8',
-        'requires_php' => '7.4',
-        'sections'     => [
-            'description' => 'Desactiva comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado (HTML/CSS/JS) en el head o el footer, y permite duplicar páginas y entradas, en un único plugin ligero, sin dependencias externas.',
-            'changelog'   => '<h4>1.3.7</h4><p><strong>Corrección:</strong> el icono del menú compartido "Caracool" (la C del logo) se salía de su recuadro en la barra lateral de wp-admin, por arriba y por abajo. WordPress escala los iconos de menú a un ancho fijo dejando la altura libre, y el dibujo de la C era mucho más alto que ancho, así que al escalarlo salía más alto de lo que cabía en el hueco del icono. Se ha centrado el mismo trazo en un lienzo cuadrado para que quepa entero, sin recortes; el logo no cambia, solo el margen a su alrededor. Si acabas de actualizar a 1.3.6 y viste el icono cortado, esta versión lo soluciona.</p><h4>1.3.6</h4><p>OneStep pasa a colgarse del menú compartido "Caracool" en vez de tener su propia entrada en la barra lateral: si en la web hay instalado más de un plugin de la casa (Motion, Carta, Churra), todos aparecen agrupados bajo "Caracool", con una portada que lista los que están puestos y su versión. El enlace y la URL de ajustes de OneStep no cambian, así que no se rompe ningún acceso guardado.</p><h4>1.3.5</h4><p>En la pestaña Código personalizado, cada snippet ahora se puede plegar y desplegar (como un desplegable/acordeón), en vez de mostrarse siempre abierto con todo el código a la vista. Los snippets que ya tienen código guardado arrancan plegados para que la pantalla no se sature si hay varios; un bloque vacío se muestra abierto, listo para escribir. Con más de un snippet aparece también un enlace para expandir o contraer todos a la vez.</p><h4>1.3.4</h4><p><strong>Corrección:</strong> el módulo Duplicar seguía sin funcionar bien en páginas de Elementor en algunos hostings: la copia se abría en el editor de Elementor pero con todo el contenido metido en un único bloque de texto, como si Elementor no reconociera su estructura interna. Causa real: al copiar los metadatos de la página, WordPress devolvía una versión recortada de la estructura interna de Elementor (probablemente por algún filtro o caché de terceros propio de ese hosting), y esa versión incompleta era la que se guardaba en la copia. Ahora esos metadatos se copian leyendo y escribiendo directamente en la base de datos, evitando cualquier filtro que pueda alterarlos por el camino. Si duplicar páginas de Elementor te seguía dando problemas tras la 1.3.1, esta versión lo soluciona.</p><h4>1.3.3</h4><p><strong>Corrección:</strong> en la pestaña Código personalizado, el texto de ejemplo del campo de código (que mostraba literalmente <code>&lt;script&gt;...&lt;/script&gt;</code>) podía hacer que el navegador cortara ahí mismo el bloque de JavaScript de la propia página de administración, dejando el resto del código visible como texto suelto debajo de "Guardar configuración" y rompiendo botones como añadir/quitar snippet, el selector de tipo o el subidor de imágenes. Se ha sustituido ese texto de ejemplo por uno que no puede confundir al navegador. Si tras actualizar a 1.3.2 veías código JavaScript "suelto" en la pantalla de OneStep, esta versión lo soluciona.</p><h4>1.3.2</h4><p><strong>Corrección crítica:</strong> en algunos hostings, el texto de ejemplo del nuevo tipo de snippet PHP (que mostraba literalmente la etiqueta de apertura de PHP como parte de un aviso) podía hacer que el propio archivo del plugin no cargara en absoluto, tumbando toda la web con un "Parse error". Se ha reescrito ese texto para evitar el problema. Si tu web se quedó en blanco tras actualizar a 1.3.0 o 1.3.1, esta versión lo soluciona.</p><h4>1.3.1</h4><p>Corrige el módulo Duplicar, sobre todo para páginas hechas con Elementor: la copia se abría con todo el contenido amontonado en un único bloque de texto en vez de conservar las secciones, columnas y contenedores del original. Ahora la copia de una página de Elementor se abre directamente en el editor de Elementor (no en el editor de bloques de WordPress) y ya no arrastra la caché de CSS del original, así que Elementor genera su propio CSS para la copia. También se evita que WordPress vuelva a filtrar el contenido al duplicar (podía borrar las marcas internas de los bloques de Gutenberg en páginas que sí usan el editor de bloques).</p><h4>1.3.0</h4><p>Código personalizado: nuevo tipo de snippet "PHP", que se ejecuta de verdad en el servidor (hooks de WooCommerce, campos personalizados, etc.) en vez de imprimirse en la página. Protegido con try/catch y una desactivación automática si falla, para que un error en un snippet no tire la web.</p><h4>1.2.0</h4><p>Nuevo módulo Duplicar: enlace "Duplicar" en el listado de Páginas y Entradas, crea una copia en borrador y lleva directamente a editarla. Compatible con WPML (etiqueta la copia con el idioma correcto). Sin coste si está desactivado.</p><h4>1.1.0</h4><p>Nuevo módulo de Código personalizado: snippets de HTML/CSS/JS insertables en el head o el footer, con control de en qué URLs se muestran. Sin coste para el sitio si no hay ningún snippet activo.</p><h4>1.0.1</h4><p>Cambio del icono del menú de admin a "admin-generic".</p><h4>1.0.0</h4><p>Versión inicial: desactivación de comentarios en todo el sitio + modo mantenimiento con página personalizable, whitelist de IPs y bypass por rol.</p>',
-        ],
-    ];
-}, 10, 3 );
+// ── Actualizaciones: las da Caracool Central con la licencia de la web ──
+// (inc/caracool-actualizador.php, común a todos los plugins de la casa).
+// Sin licencia, pregunta a GitHub como antes.
+caracool_actualizador_v2(
+    array(
+        'archivo' => __FILE__,
+        'slug'    => 'onestep',
+        'version' => CARACOOL_ONESTEP_VERSION,
+        'repo'    => 'caracoolnet/wp-onestep',
+        'nombre'  => 'Caracool OneStep',
+        'resumen' => 'Desactiva comentarios, modo mantenimiento, código personalizado en el head o el footer y duplicar páginas y entradas, en un único plugin ligero.',
+    )
+);
