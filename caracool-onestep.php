@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.1
+ * Version:     1.5.2
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.1' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.2' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1858,6 +1858,10 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/plugins/subir', [
             'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_subir_zip' ], 'permission_callback' => $perm,
         ] );
+        // 1.5.2: borrar un tema que no esté en uso (los plugins se borran por la REST de WordPress).
+        register_rest_route( $ns, '/temas/(?P<tema>[A-Za-z0-9._-]+)', [
+            'methods' => \WP_REST_Server::DELETABLE, 'callback' => [ $this, 'claude_borrar_tema' ], 'permission_callback' => $perm,
+        ] );
     }
 
     /**
@@ -2460,8 +2464,7 @@ class Caracool_OneStep {
 
     /**
      * POST /plugins/instalar {url, activar?}: instala o sustituye un plugin
-     * desde un zip. Solo de releases de github.com/caracoolnet o de
-     * downloads.wordpress.org. Si ya existe, se reemplaza y conserva su
+     * desde un zip por https (desde 1.5.2, de cualquier dominio público). Si ya existe, se reemplaza y conserva su
      * estado (activo o no).
      */
     public function claude_instalar_zip( \WP_REST_Request $request ) {
@@ -2469,7 +2472,7 @@ class Caracool_OneStep {
         if ( is_wp_error( $ok ) ) return $ok;
         $url = (string) $request->get_param( 'url' );
         if ( ! self::claude_zip_permitido( $url ) ) {
-            return new \WP_Error( 'co_origen', 'Por URL solo se instalan zips de https://github.com/caracoolnet/… o de https://downloads.wordpress.org/plugin/…. Un zip suelto se sube con /plugins/subir.', [ 'status' => 400 ] );
+            return new \WP_Error( 'co_origen', 'La URL del zip tiene que ser https y de un dominio público.', [ 'status' => 400 ] );
         }
         return $this->claude_instalar_paquete( $url, (bool) $request->get_param( 'activar' ) );
     }
@@ -2540,13 +2543,38 @@ class Caracool_OneStep {
         ];
     }
 
+    /**
+     * 1.5.2: cualquier zip por https. La descarga va con wp_safe_remote_get
+     * (download_url), que ya rechaza direcciones internas de la red.
+     */
     public static function claude_zip_permitido( $url ) {
         $p = wp_parse_url( (string) $url );
-        if ( ! $p || ( $p['scheme'] ?? '' ) !== 'https' || empty( $p['host'] ) ) return false;
-        $ruta = (string) ( $p['path'] ?? '' );
-        if ( 'github.com' === $p['host'] ) return 0 === stripos( $ruta, '/caracoolnet/' ) && false !== strpos( $ruta, '/releases/' );
-        if ( 'downloads.wordpress.org' === $p['host'] ) return 0 === strpos( $ruta, '/plugin/' );
-        return false;
+        return $p && ( $p['scheme'] ?? '' ) === 'https' && ! empty( $p['host'] ) && false !== strpos( $p['host'], '.' );
+    }
+
+    /**
+     * DELETE /temas/<carpeta>: borra un tema instalado que no sea el activo
+     * ni el padre del activo. No se puede deshacer.
+     */
+    public function claude_borrar_tema( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_mantener( 'delete_themes' );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $tema = (string) $request->get_param( 'tema' );
+        $t = wp_get_theme( $tema );
+        if ( ! $t->exists() ) return new \WP_Error( 'co_tema', 'No hay ningún tema instalado en la carpeta «' . $tema . '».', [ 'status' => 404 ] );
+        if ( in_array( $tema, [ get_stylesheet(), get_template() ], true ) ) {
+            return new \WP_Error( 'co_tema_en_uso', '«' . $t->get( 'Name' ) . '» está en uso (es el tema activo o su padre). Primero hay que activar otro.', [ 'status' => 409 ] );
+        }
+        $this->claude_cargar_actualizador();
+        $fs = $this->claude_sistema_archivos();
+        if ( is_wp_error( $fs ) ) return $fs;
+        $nombre  = $t->get( 'Name' );
+        $version = $t->get( 'Version' );
+        $r = delete_theme( $tema );
+        if ( is_wp_error( $r ) ) return $r;
+        if ( ! $r ) return new \WP_Error( 'co_tema', 'WordPress no ha podido borrar el tema.', [ 'status' => 500 ] );
+        $this->claude_registrar( 'borrar_tema', 0, $tema . ' ' . $version );
+        return [ 'borrado' => $tema, 'nombre' => $nombre, 'version' => $version ];
     }
 
     private function claude_mensajes( $skin ) {
