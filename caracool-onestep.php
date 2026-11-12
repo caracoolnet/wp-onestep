@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.0
+ * Version:     1.5.1
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.0' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.1' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1854,6 +1854,10 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/plugins/instalar', [
             'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_instalar_zip' ], 'permission_callback' => $perm,
         ] );
+        // 1.5.1: un zip que manda Claude desde el Mac (plugins de pago, zips sueltos).
+        register_rest_route( $ns, '/plugins/subir', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_subir_zip' ], 'permission_callback' => $perm,
+        ] );
     }
 
     /**
@@ -2465,8 +2469,44 @@ class Caracool_OneStep {
         if ( is_wp_error( $ok ) ) return $ok;
         $url = (string) $request->get_param( 'url' );
         if ( ! self::claude_zip_permitido( $url ) ) {
-            return new \WP_Error( 'co_origen', 'Solo se instalan zips de https://github.com/caracoolnet/… o de https://downloads.wordpress.org/plugin/….', [ 'status' => 400 ] );
+            return new \WP_Error( 'co_origen', 'Por URL solo se instalan zips de https://github.com/caracoolnet/… o de https://downloads.wordpress.org/plugin/…. Un zip suelto se sube con /plugins/subir.', [ 'status' => 400 ] );
         }
+        return $this->claude_instalar_paquete( $url, (bool) $request->get_param( 'activar' ) );
+    }
+
+    /**
+     * POST /plugins/subir {zip (base64), nombre?, activar?}: instala o
+     * sustituye un plugin desde un zip que manda Claude desde el Mac de la
+     * persona (plugins de pago, zips que no están en una release). Máximo
+     * 25 MB. Mismo resultado que /plugins/instalar.
+     */
+    public function claude_subir_zip( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_mantener( 'install_plugins' );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $datos = base64_decode( (string) $request->get_param( 'zip' ), true );
+        if ( false === $datos || '' === $datos ) {
+            return new \WP_Error( 'co_zip', 'Falta el zip, o no viene en base64.', [ 'status' => 400 ] );
+        }
+        if ( strlen( $datos ) > 25 * 1048576 ) {
+            return new \WP_Error( 'co_zip', 'El zip pasa de 25 MB.', [ 'status' => 413 ] );
+        }
+        if ( 0 !== strncmp( $datos, "PK\x03\x04", 4 ) ) {
+            return new \WP_Error( 'co_zip', 'El archivo no es un zip.', [ 'status' => 400 ] );
+        }
+        $this->claude_cargar_actualizador();
+        $nombre = sanitize_file_name( (string) ( $request->get_param( 'nombre' ) ?: 'plugin.zip' ) );
+        if ( ! preg_match( '/\.zip$/i', $nombre ) ) $nombre .= '.zip';
+        $tmp = wp_tempnam( $nombre );
+        if ( ! $tmp || false === file_put_contents( $tmp, $datos ) ) {
+            return new \WP_Error( 'co_zip', 'No se ha podido guardar el zip en la carpeta temporal.', [ 'status' => 500 ] );
+        }
+        $r = $this->claude_instalar_paquete( $tmp, (bool) $request->get_param( 'activar' ), $nombre );
+        if ( file_exists( $tmp ) ) @unlink( $tmp );
+        return $r;
+    }
+
+    /** Instala un paquete (URL permitida o archivo temporal) y deja el plugin como estaba, o activo si se pide. */
+    private function claude_instalar_paquete( $paquete, $activar, $origen = '' ) {
         $this->claude_cargar_actualizador();
         $fs = $this->claude_sistema_archivos();
         if ( is_wp_error( $fs ) ) return $fs;
@@ -2474,7 +2514,7 @@ class Caracool_OneStep {
         $antes = get_plugins();
         $skin  = new \WP_Ajax_Upgrader_Skin();
         $up    = new \Plugin_Upgrader( $skin );
-        $r     = $up->install( $url, [ 'overwrite_package' => true ] );
+        $r     = $up->install( $paquete, [ 'overwrite_package' => true ] );
         if ( is_wp_error( $r ) ) return $r;
         if ( ! $r ) {
             $err = $skin->get_errors();
@@ -2484,13 +2524,12 @@ class Caracool_OneStep {
         $file = $up->plugin_info();
         if ( ! $file ) return new \WP_Error( 'co_instalar', 'El zip no contiene un plugin reconocible.', [ 'status' => 500 ] );
         $era  = isset( $antes[ $file ] );
-        $activar = $request->get_param( 'activar' );
         if ( $activar && ! is_plugin_active( $file ) ) {
             $a = activate_plugin( $file, '', false, false );
             if ( is_wp_error( $a ) ) return new \WP_Error( 'co_activar', 'Instalado, pero no se ha podido activar: ' . $a->get_error_message(), [ 'status' => 500 ] );
         }
         $ahora = get_plugins()[ $file ] ?? [];
-        $this->claude_registrar( 'instalar', 0, $file . ' ' . ( $ahora['Version'] ?? '' ) );
+        $this->claude_registrar( 'instalar', 0, trim( $file . ' ' . ( $ahora['Version'] ?? '' ) . ( $origen ? ' (zip subido: ' . $origen . ')' : '' ) ) );
         return [
             'plugin'    => $file,
             'nombre'    => $ahora['Name'] ?? $file,
