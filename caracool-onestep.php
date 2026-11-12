@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.4.4
+ * Version:     1.5.0
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.4.4' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.0' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -674,7 +674,7 @@ class Caracool_OneStep {
                                     <option value="<?php echo (int) $co_u->ID; ?>" <?php selected( (int) $s['claude_user_id'], (int) $co_u->ID ); ?>><?php echo esc_html( $co_u->display_name . ' (' . $co_u->user_login . ')' ); ?></option>
                                 <?php endforeach; ?>
                             </select>
-                            <p class="co-field-hint">Mejor un usuario solo para esto (por ejemplo «claude», con rol Editor), para que en el historial se vea qué cambió Claude y poder cortarle el acceso sin tocar a nadie más.</p>
+                            <p class="co-field-hint">Mejor un usuario solo para esto (por ejemplo «claude»), para que en el historial se vea qué cambió Claude y poder cortarle el acceso sin tocar a nadie más. Con rol Editor solo edita páginas; como Administrador también puede actualizar plugins, temas y WordPress.</p>
                         </div>
 
                         <?php if ( ! $co_app_pw_ok ) : ?>
@@ -1844,6 +1844,16 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/elementor/(?P<id>\d+)/revisiones/(?P<rev>\d+)', [
             'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_restaurar' ], 'permission_callback' => $perm,
         ] );
+        // Mantenimiento (1.5.0): solo si el usuario de Claude es Administrador.
+        register_rest_route( $ns, '/actualizaciones', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_actualizaciones' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/actualizar', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_actualizar' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/plugins/instalar', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_instalar_zip' ], 'permission_callback' => $perm,
+        ] );
     }
 
     /**
@@ -1925,6 +1935,8 @@ class Caracool_OneStep {
             'idiomas'       => $idiomas,
             'idioma_defecto'=> $idiomas ? apply_filters( 'wpml_default_language', null ) : null,
             'usuario'       => wp_get_current_user()->user_login,
+            // Actualizar plugins, temas y WordPress pide un usuario Administrador.
+            'mantenimiento' => $this->claude_puede_mantener( 'update_plugins' ) === true,
         ];
     }
 
@@ -2269,6 +2281,237 @@ class Caracool_OneStep {
         delete_post_meta_by_key( '_elementor_element_cache' );
         $this->claude_registrar( 'cache', 0, '' );
         return [ 'ok' => true ];
+    }
+
+    // ── Mantenimiento: actualizaciones e instalación (1.5.0) ──
+    // Lo mismo que Escritorio → Actualizaciones, sin sesión. Pide que el
+    // usuario de Claude tenga el permiso de WordPress correspondiente
+    // (Administrador) y que la web permita cambiar archivos.
+
+    /** true, o el WP_Error que explica por qué no se puede. */
+    private function claude_puede_mantener( $cap ) {
+        if ( defined( 'DISALLOW_FILE_MODS' ) && DISALLOW_FILE_MODS ) {
+            return new \WP_Error( 'co_sin_cambios_archivos', 'Esta web tiene DISALLOW_FILE_MODS: no deja instalar ni actualizar nada desde WordPress.', [ 'status' => 403 ] );
+        }
+        if ( ! current_user_can( $cap ) ) {
+            return new \WP_Error( 'co_sin_mantenimiento', 'El usuario de Claude no tiene el permiso «' . $cap . '». Para actualizar o instalar, tiene que ser Administrador.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    private function claude_cargar_actualizador() {
+        foreach ( [ 'file.php', 'misc.php', 'plugin.php', 'theme.php', 'update.php', 'class-wp-upgrader.php', 'translation-install.php' ] as $f ) {
+            require_once ABSPATH . 'wp-admin/includes/' . $f;
+        }
+    }
+
+    /** Sin credenciales FTP: si el hosting no deja escribir directamente, se dice. */
+    private function claude_sistema_archivos() {
+        if ( 'direct' !== get_filesystem_method() ) {
+            return new \WP_Error( 'co_sin_escritura', 'WordPress no puede escribir los archivos directamente en este hosting (pide FTP). Hay que actualizar desde el escritorio.', [ 'status' => 500 ] );
+        }
+        WP_Filesystem();
+        return true;
+    }
+
+    /** GET /actualizaciones: lo que WordPress ofrece ahora. ?refrescar=1 vuelve a preguntar. */
+    public function claude_actualizaciones( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_mantener( 'update_plugins' );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $this->claude_cargar_actualizador();
+        if ( $request->get_param( 'refrescar' ) ) {
+            delete_site_transient( 'update_plugins' );
+            delete_site_transient( 'update_themes' );
+            wp_version_check( [], true );
+        }
+        wp_update_plugins();
+        wp_update_themes();
+
+        $plugins = [];
+        $todos   = get_plugins();
+        $up      = get_site_transient( 'update_plugins' );
+        foreach ( (array) ( $up->response ?? [] ) as $file => $info ) {
+            $plugins[] = [
+                'plugin'  => $file,
+                'nombre'  => $todos[ $file ]['Name'] ?? $file,
+                'version' => $todos[ $file ]['Version'] ?? null,
+                'nueva'   => $info->new_version ?? null,
+                'activo'  => is_plugin_active( $file ),
+            ];
+        }
+        $temas = [];
+        $ut    = get_site_transient( 'update_themes' );
+        foreach ( (array) ( $ut->response ?? [] ) as $slug => $info ) {
+            $t = wp_get_theme( $slug );
+            $temas[] = [ 'tema' => $slug, 'nombre' => $t->get( 'Name' ), 'version' => $t->get( 'Version' ), 'nueva' => $info['new_version'] ?? null ];
+        }
+        $core = null;
+        foreach ( (array) get_core_updates() as $u ) {
+            if ( isset( $u->response ) && 'upgrade' === $u->response ) {
+                $core = [ 'version' => get_bloginfo( 'version' ), 'nueva' => $u->current, 'menor' => $this->claude_es_menor( $u->current ) ];
+                break;
+            }
+        }
+        return [
+            'plugins'      => $plugins,
+            'temas'        => $temas,
+            'wordpress'    => $core,
+            'traducciones' => count( wp_get_translation_updates() ),
+            'instalados'   => array_map( function ( $file ) use ( $todos ) {
+                return [ 'plugin' => $file, 'nombre' => $todos[ $file ]['Name'], 'version' => $todos[ $file ]['Version'], 'activo' => is_plugin_active( $file ) ];
+            }, array_keys( $todos ) ),
+        ];
+    }
+
+    /** ¿La versión nueva es de la misma rama (7.1.x → 7.1.y)? */
+    private function claude_es_menor( $nueva ) {
+        $a = explode( '.', get_bloginfo( 'version' ) );
+        $b = explode( '.', (string) $nueva );
+        return ( $a[0] ?? '' ) === ( $b[0] ?? '' ) && ( $a[1] ?? '0' ) === ( $b[1] ?? '0' );
+    }
+
+    /**
+     * POST /actualizar {tipo: plugins|temas|traducciones|wordpress, items?: [...], mayor?: bool}
+     * Sin items, actualiza todo lo que haya de ese tipo. WordPress solo sube
+     * de rama (7.1 → 7.2) con mayor:true. Los plugins activos siguen activos.
+     */
+    public function claude_actualizar( \WP_REST_Request $request ) {
+        $tipo  = (string) $request->get_param( 'tipo' );
+        $caps  = [ 'plugins' => 'update_plugins', 'temas' => 'update_themes', 'traducciones' => 'update_languages', 'wordpress' => 'update_core' ];
+        if ( ! isset( $caps[ $tipo ] ) ) {
+            return new \WP_Error( 'co_tipo', 'tipo tiene que ser plugins, temas, traducciones o wordpress.', [ 'status' => 400 ] );
+        }
+        $ok = $this->claude_puede_mantener( $caps[ $tipo ] );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $this->claude_cargar_actualizador();
+        $fs = $this->claude_sistema_archivos();
+        if ( is_wp_error( $fs ) ) return $fs;
+
+        $items = array_values( array_filter( array_map( 'strval', (array) $request->get_param( 'items' ) ) ) );
+        $skin  = new \WP_Ajax_Upgrader_Skin();
+        $res   = [];
+
+        if ( 'plugins' === $tipo ) {
+            wp_update_plugins();
+            $ofrecidos = array_keys( (array) ( get_site_transient( 'update_plugins' )->response ?? [] ) );
+            $lista     = $items ? array_values( array_intersect( $items, $ofrecidos ) ) : $ofrecidos;
+            $sin       = array_values( array_diff( $items, $ofrecidos ) );
+            if ( ! $lista ) return [ 'actualizados' => [], 'sin_actualizacion' => $sin ];
+            $activos = array_filter( $lista, 'is_plugin_active' );
+            $antes   = get_plugins();
+            $r       = ( new \Plugin_Upgrader( $skin ) )->bulk_upgrade( $lista );
+            wp_clean_plugins_cache();
+            $despues = get_plugins();
+            foreach ( $lista as $file ) {
+                if ( in_array( $file, $activos, true ) && ! is_plugin_active( $file ) ) activate_plugin( $file, '', false, true );
+                $res[] = [
+                    'plugin'  => $file,
+                    'antes'   => $antes[ $file ]['Version'] ?? null,
+                    'ahora'   => $despues[ $file ]['Version'] ?? null,
+                    'ok'      => ! empty( $r[ $file ] ) && ! is_wp_error( $r[ $file ] ),
+                    'activo'  => is_plugin_active( $file ),
+                ];
+            }
+            $this->claude_registrar( 'actualizar', 0, 'plugins: ' . implode( ', ', $lista ) );
+            return [ 'actualizados' => $res, 'sin_actualizacion' => $sin, 'mensajes' => $this->claude_mensajes( $skin ) ];
+        }
+
+        if ( 'temas' === $tipo ) {
+            wp_update_themes();
+            $ofrecidos = array_keys( (array) ( get_site_transient( 'update_themes' )->response ?? [] ) );
+            $lista     = $items ? array_values( array_intersect( $items, $ofrecidos ) ) : $ofrecidos;
+            if ( ! $lista ) return [ 'actualizados' => [], 'sin_actualizacion' => $items ];
+            $r = ( new \Theme_Upgrader( $skin ) )->bulk_upgrade( $lista );
+            foreach ( $lista as $slug ) {
+                $res[] = [ 'tema' => $slug, 'ahora' => wp_get_theme( $slug )->get( 'Version' ), 'ok' => ! empty( $r[ $slug ] ) && ! is_wp_error( $r[ $slug ] ) ];
+            }
+            $this->claude_registrar( 'actualizar', 0, 'temas: ' . implode( ', ', $lista ) );
+            return [ 'actualizados' => $res, 'mensajes' => $this->claude_mensajes( $skin ) ];
+        }
+
+        if ( 'traducciones' === $tipo ) {
+            $packs = wp_get_translation_updates();
+            if ( ! $packs ) return [ 'actualizados' => 0 ];
+            $r = ( new \Language_Pack_Upgrader( $skin ) )->bulk_upgrade( $packs );
+            $this->claude_registrar( 'actualizar', 0, 'traducciones: ' . count( $packs ) );
+            return [ 'actualizados' => is_array( $r ) ? count( array_filter( $r ) ) : 0, 'de' => count( $packs ), 'mensajes' => $this->claude_mensajes( $skin ) ];
+        }
+
+        // wordpress
+        wp_version_check( [], true );
+        $oferta = null;
+        foreach ( (array) get_core_updates() as $u ) {
+            if ( isset( $u->response ) && 'upgrade' === $u->response ) { $oferta = $u; break; }
+        }
+        if ( ! $oferta ) return [ 'actualizado' => false, 'detalle' => 'WordPress ya está al día (' . get_bloginfo( 'version' ) . ').' ];
+        if ( ! $this->claude_es_menor( $oferta->current ) && ! $request->get_param( 'mayor' ) ) {
+            return new \WP_Error( 'co_mayor', 'La actualización ' . get_bloginfo( 'version' ) . ' → ' . $oferta->current . ' cambia de rama. Repite con mayor:true si la persona lo ha aprobado.', [ 'status' => 409 ] );
+        }
+        $antes = get_bloginfo( 'version' );
+        $r     = ( new \Core_Upgrader( $skin ) )->upgrade( $oferta );
+        if ( is_wp_error( $r ) ) return $r;
+        $this->claude_registrar( 'actualizar', 0, 'WordPress ' . $antes . ' → ' . $oferta->current );
+        return [ 'actualizado' => true, 'antes' => $antes, 'ahora' => $oferta->current, 'mensajes' => $this->claude_mensajes( $skin ) ];
+    }
+
+    /**
+     * POST /plugins/instalar {url, activar?}: instala o sustituye un plugin
+     * desde un zip. Solo de releases de github.com/caracoolnet o de
+     * downloads.wordpress.org. Si ya existe, se reemplaza y conserva su
+     * estado (activo o no).
+     */
+    public function claude_instalar_zip( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_mantener( 'install_plugins' );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $url = (string) $request->get_param( 'url' );
+        if ( ! self::claude_zip_permitido( $url ) ) {
+            return new \WP_Error( 'co_origen', 'Solo se instalan zips de https://github.com/caracoolnet/… o de https://downloads.wordpress.org/plugin/….', [ 'status' => 400 ] );
+        }
+        $this->claude_cargar_actualizador();
+        $fs = $this->claude_sistema_archivos();
+        if ( is_wp_error( $fs ) ) return $fs;
+
+        $antes = get_plugins();
+        $skin  = new \WP_Ajax_Upgrader_Skin();
+        $up    = new \Plugin_Upgrader( $skin );
+        $r     = $up->install( $url, [ 'overwrite_package' => true ] );
+        if ( is_wp_error( $r ) ) return $r;
+        if ( ! $r ) {
+            $err = $skin->get_errors();
+            return new \WP_Error( 'co_instalar', 'No se ha podido instalar: ' . implode( ' · ', $this->claude_mensajes( $skin ) ), [ 'status' => 500, 'errores' => is_wp_error( $err ) ? $err->get_error_messages() : [] ] );
+        }
+        wp_clean_plugins_cache();
+        $file = $up->plugin_info();
+        if ( ! $file ) return new \WP_Error( 'co_instalar', 'El zip no contiene un plugin reconocible.', [ 'status' => 500 ] );
+        $era  = isset( $antes[ $file ] );
+        $activar = $request->get_param( 'activar' );
+        if ( $activar && ! is_plugin_active( $file ) ) {
+            $a = activate_plugin( $file, '', false, false );
+            if ( is_wp_error( $a ) ) return new \WP_Error( 'co_activar', 'Instalado, pero no se ha podido activar: ' . $a->get_error_message(), [ 'status' => 500 ] );
+        }
+        $ahora = get_plugins()[ $file ] ?? [];
+        $this->claude_registrar( 'instalar', 0, $file . ' ' . ( $ahora['Version'] ?? '' ) );
+        return [
+            'plugin'    => $file,
+            'nombre'    => $ahora['Name'] ?? $file,
+            'antes'     => $era ? $antes[ $file ]['Version'] : null,
+            'ahora'     => $ahora['Version'] ?? null,
+            'activo'    => is_plugin_active( $file ),
+            'mensajes'  => $this->claude_mensajes( $skin ),
+        ];
+    }
+
+    public static function claude_zip_permitido( $url ) {
+        $p = wp_parse_url( (string) $url );
+        if ( ! $p || ( $p['scheme'] ?? '' ) !== 'https' || empty( $p['host'] ) ) return false;
+        $ruta = (string) ( $p['path'] ?? '' );
+        if ( 'github.com' === $p['host'] ) return 0 === stripos( $ruta, '/caracoolnet/' ) && false !== strpos( $ruta, '/releases/' );
+        if ( 'downloads.wordpress.org' === $p['host'] ) return 0 === strpos( $ruta, '/plugin/' );
+        return false;
+    }
+
+    private function claude_mensajes( $skin ) {
+        return array_slice( array_values( array_filter( array_map( 'wp_strip_all_tags', (array) $skin->get_upgrade_messages() ) ) ), -12 );
     }
 
     // ── Piezas internas ───────────────────────────────────────
