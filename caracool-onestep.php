@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.2
+ * Version:     1.5.3
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.2' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.3' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1862,6 +1862,18 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/temas/(?P<tema>[A-Za-z0-9._-]+)', [
             'methods' => \WP_REST_Server::DELETABLE, 'callback' => [ $this, 'claude_borrar_tema' ], 'permission_callback' => $perm,
         ] );
+        // 1.5.3: los códigos personalizados de la pestaña Código (head/footer, HTML o PHP).
+        register_rest_route( $ns, '/codigos', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_codigos' ], 'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_codigo_crear' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/codigos/(?P<i>\d+)', [
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_codigo_cambiar' ], 'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::DELETABLE, 'callback' => [ $this, 'claude_codigo_quitar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/codigos/papelera', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_codigos_papelera' ], 'permission_callback' => $perm ],
+        ] );
     }
 
     /**
@@ -2579,6 +2591,173 @@ class Caracool_OneStep {
 
     private function claude_mensajes( $skin ) {
         return array_slice( array_values( array_filter( array_map( 'wp_strip_all_tags', (array) $skin->get_upgrade_messages() ) ) ), -12 );
+    }
+
+    // ── Códigos personalizados (1.5.3) ────────────────────────
+    // Los mismos snippets de la pestaña Código: se guardan en
+    // settings['snippets'] y los pinta/ejecuta snippets_bootstrap(). Como un
+    // snippet puede ser JavaScript o PHP que se ejecuta en el servidor, todo
+    // pide manage_options (Administrador). Los que se quitan van a una
+    // papelera (los últimos 20) para poder recuperarlos.
+
+    const CODIGOS_PAPELERA = 'caracool_onestep_snippets_papelera';
+
+    private function claude_puede_codigo() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new \WP_Error( 'co_sin_codigos', 'Los códigos personalizados solo los toca un Administrador: el usuario de Claude tiene que tener ese rol.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    private function claude_lista_codigos() {
+        $s = $this->get_settings();
+        return array_values( is_array( $s['snippets'] ?? null ) ? $s['snippets'] : [] );
+    }
+
+    private static function claude_huella_codigos( $lista ) {
+        return substr( md5( (string) wp_json_encode( $lista ) ), 0, 12 );
+    }
+
+    private function claude_guardar_codigos( $lista ) {
+        $s = $this->get_settings();
+        $s['snippets'] = array_values( $lista );
+        update_option( self::OPTION_KEY, $s );
+    }
+
+    private static function claude_codigo_salida( $i, $c ) {
+        return [
+            'indice'      => (int) $i,
+            'nombre'      => (string) ( $c['name'] ?? '' ),
+            'tipo'        => (string) ( $c['type'] ?? 'html' ),
+            'ubicacion'   => (string) ( $c['location'] ?? 'footer' ),
+            'activo'      => ! empty( $c['active'] ),
+            'visibilidad' => (string) ( $c['visibility'] ?? 'all' ),
+            'urls'        => array_values( (array) ( $c['urls'] ?? [] ) ),
+            'codigo'      => (string) ( $c['code'] ?? '' ),
+        ];
+    }
+
+    /**
+     * Aplica los campos recibidos sobre un snippet (nuevo o existente) con las
+     * mismas reglas que el formulario de la pestaña Código. Un PHP con error
+     * de sintaxis no se guarda.
+     */
+    public static function claude_codigo_desde( $p, $base = [] ) {
+        $c = wp_parse_args( $base, [ 'name' => '', 'code' => '', 'type' => 'html', 'location' => 'footer', 'active' => false, 'visibility' => 'all', 'urls' => [] ] );
+        if ( array_key_exists( 'nombre', $p ) )    $c['name'] = sanitize_text_field( (string) $p['nombre'] );
+        if ( array_key_exists( 'codigo', $p ) )    $c['code'] = (string) $p['codigo'];
+        if ( array_key_exists( 'tipo', $p ) ) {
+            if ( ! in_array( $p['tipo'], [ 'html', 'php' ], true ) ) return new \WP_Error( 'co_codigo', '«tipo» es html o php.', [ 'status' => 400 ] );
+            $c['type'] = $p['tipo'];
+        }
+        if ( array_key_exists( 'ubicacion', $p ) ) {
+            if ( ! in_array( $p['ubicacion'], [ 'head', 'footer' ], true ) ) return new \WP_Error( 'co_codigo', '«ubicacion» es head o footer.', [ 'status' => 400 ] );
+            $c['location'] = $p['ubicacion'];
+        }
+        if ( array_key_exists( 'visibilidad', $p ) ) {
+            if ( ! in_array( $p['visibilidad'], [ 'all', 'all_except', 'only' ], true ) ) return new \WP_Error( 'co_codigo', '«visibilidad» es all, all_except u only.', [ 'status' => 400 ] );
+            $c['visibility'] = $p['visibilidad'];
+        }
+        if ( array_key_exists( 'urls', $p ) ) {
+            $c['urls'] = array_values( array_filter( array_map( function ( $u ) { return trim( sanitize_text_field( (string) $u ) ); }, (array) $p['urls'] ) ) );
+        }
+        if ( array_key_exists( 'activo', $p ) ) $c['active'] = (bool) $p['activo'];
+
+        if ( '' === trim( $c['name'] ) ) return new \WP_Error( 'co_codigo', 'El código necesita un «nombre».', [ 'status' => 400 ] );
+        if ( '' === trim( $c['code'] ) ) return new \WP_Error( 'co_codigo', 'Falta el «codigo».', [ 'status' => 400 ] );
+        if ( 'php' === $c['type'] ) {
+            // eval() no lleva etiqueta de apertura: se quita si viene.
+            $c['code'] = preg_replace( '/^\s*<\?php\b/i', '', $c['code'] );
+            $c['code'] = preg_replace( '/\?>\s*$/', '', $c['code'] );
+            try {
+                token_get_all( '<?php ' . $c['code'], TOKEN_PARSE );
+            } catch ( \ParseError $e ) {
+                return new \WP_Error( 'co_codigo_php', 'El PHP tiene un error de sintaxis (línea ' . $e->getLine() . '): ' . $e->getMessage() . '. No se ha guardado.', [ 'status' => 400 ] );
+            }
+        }
+        return $c;
+    }
+
+    /** GET /codigos: todos los códigos, con su índice, y la «version» de la lista. */
+    public function claude_codigos( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_codigo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $lista = $this->claude_lista_codigos();
+        $out = [];
+        foreach ( $lista as $i => $c ) $out[] = self::claude_codigo_salida( $i, $c );
+        $error = get_option( 'caracool_onestep_php_error' );
+        return [ 'version' => self::claude_huella_codigos( $lista ), 'codigos' => $out, 'ultimo_error_php' => $error ?: null ];
+    }
+
+    private function claude_codigos_comprobar_version( $request, $lista ) {
+        $v = (string) $request->get_param( 'version' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» de la lista (la da GET /codigos).', [ 'status' => 428 ] );
+        $actual = self::claude_huella_codigos( $lista );
+        if ( $v !== $actual ) return new \WP_Error( 'co_cambiada', 'Los códigos han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409, 'version' => $actual ] );
+        return true;
+    }
+
+    /** POST /codigos {nombre, codigo, tipo, ubicacion, activo, visibilidad, urls, version}: añade uno al final. */
+    public function claude_codigo_crear( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_codigo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $lista = $this->claude_lista_codigos();
+        $v = $this->claude_codigos_comprobar_version( $request, $lista );
+        if ( is_wp_error( $v ) ) return $v;
+        $c = self::claude_codigo_desde( (array) $request->get_json_params() );
+        if ( is_wp_error( $c ) ) return $c;
+        $lista[] = $c;
+        $this->claude_guardar_codigos( $lista );
+        $i = count( $lista ) - 1;
+        $this->claude_registrar( 'codigo_crear', 0, '#' . $i . ' ' . $c['name'] . ' (' . $c['type'] . ', ' . ( $c['active'] ? 'activo' : 'inactivo' ) . ')' );
+        return [ 'version' => self::claude_huella_codigos( $lista ), 'codigo' => self::claude_codigo_salida( $i, $c ) ];
+    }
+
+    /** POST /codigos/<i> {campos que cambian, version}: cambia uno (también activarlo o desactivarlo). */
+    public function claude_codigo_cambiar( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_codigo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $lista = $this->claude_lista_codigos();
+        $i = (int) $request->get_param( 'i' );
+        if ( ! isset( $lista[ $i ] ) ) return new \WP_Error( 'co_codigo', 'No hay ningún código con el índice ' . $i . '.', [ 'status' => 404 ] );
+        $v = $this->claude_codigos_comprobar_version( $request, $lista );
+        if ( is_wp_error( $v ) ) return $v;
+        $c = self::claude_codigo_desde( (array) $request->get_json_params(), $lista[ $i ] );
+        if ( is_wp_error( $c ) ) return $c;
+        $lista[ $i ] = $c;
+        $this->claude_guardar_codigos( $lista );
+        $this->claude_registrar( 'codigo_cambiar', 0, '#' . $i . ' ' . $c['name'] . ' (' . ( $c['active'] ? 'activo' : 'inactivo' ) . ')' );
+        return [ 'version' => self::claude_huella_codigos( $lista ), 'codigo' => self::claude_codigo_salida( $i, $c ) ];
+    }
+
+    /** DELETE /codigos/<i>?version=…: lo quita de la lista y lo guarda en la papelera de códigos. */
+    public function claude_codigo_quitar( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_codigo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $lista = $this->claude_lista_codigos();
+        $i = (int) $request->get_param( 'i' );
+        if ( ! isset( $lista[ $i ] ) ) return new \WP_Error( 'co_codigo', 'No hay ningún código con el índice ' . $i . '.', [ 'status' => 404 ] );
+        $v = $this->claude_codigos_comprobar_version( $request, $lista );
+        if ( is_wp_error( $v ) ) return $v;
+        $c = $lista[ $i ];
+        $papelera = (array) get_option( self::CODIGOS_PAPELERA, [] );
+        array_unshift( $papelera, [ 'fecha' => current_time( 'mysql' ), 'codigo' => $c ] );
+        update_option( self::CODIGOS_PAPELERA, array_slice( $papelera, 0, 20 ), false );
+        array_splice( $lista, $i, 1 );
+        $this->claude_guardar_codigos( $lista );
+        $this->claude_registrar( 'codigo_quitar', 0, '#' . $i . ' ' . ( $c['name'] ?? '' ) . ' (a la papelera de códigos)' );
+        return [ 'version' => self::claude_huella_codigos( $lista ), 'quitado' => self::claude_codigo_salida( $i, $c ) ];
+    }
+
+    /** GET /codigos/papelera: los últimos códigos quitados, para recuperarlos con POST /codigos. */
+    public function claude_codigos_papelera( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_codigo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $out = [];
+        foreach ( (array) get_option( self::CODIGOS_PAPELERA, [] ) as $k => $e ) {
+            $out[] = [ 'fecha' => $e['fecha'] ?? '' ] + self::claude_codigo_salida( $k, (array) ( $e['codigo'] ?? [] ) );
+        }
+        return $out;
     }
 
     // ── Piezas internas ───────────────────────────────────────
