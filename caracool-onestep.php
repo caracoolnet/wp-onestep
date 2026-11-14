@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.4
+ * Version:     1.5.5
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.4' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.5' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1888,6 +1888,11 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/menus/papelera/(?P<i>\d+)', [
             [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_menu_restaurar' ], 'permission_callback' => $perm ],
         ] );
+        // 1.5.5: ajustes de WordPress (Generales, Escritura, Lectura, Comentarios, Medios, Enlaces permanentes, Privacidad).
+        register_rest_route( $ns, '/ajustes', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_ajustes' ], 'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_ajustes_guardar' ], 'permission_callback' => $perm ],
+        ] );
     }
 
     /**
@@ -3407,6 +3412,277 @@ class Caracool_OneStep {
         do_action( 'wp_update_nav_menu', $menu_id, [] );
         $this->claude_registrar( 'menu_restaurar', 0, ( $e['elemento']['titulo'] ?? '' ) . ' → ' . $menu->name . ' (' . $como . ')' );
         return [ 'restaurado' => $id, 'como' => $como ] + $this->claude_menu_leer( $menu );
+    }
+
+    // ── Ajustes de WordPress (1.5.5) ──────────────────────────
+    // Las pantallas de Ajustes (General, Escritura, Lectura, Comentarios,
+    // Medios, Enlaces permanentes y Privacidad) por una lista cerrada de
+    // opciones, cada una con su comprobación. Lo que puede dejar la web
+    // inaccesible (la dirección) o toca cuentas y permisos (email del
+    // administrador, registro abierto, rol por defecto) no se toca. Lo que
+    // afecta al SEO (enlaces permanentes, ocultar a buscadores) pide
+    // «confirmar». Con «probar» dice qué cambiaría sin guardar nada.
+
+    /** opción => [pantalla, tipo, extra]. Tipos: texto, textarea, entero, si_no, lista, pagina, categoria, zona, idioma, formato, enlace. */
+    const AJUSTES = [
+        'blogname'                     => [ 'general', 'texto' ],
+        'blogdescription'              => [ 'general', 'texto' ],
+        'timezone_string'              => [ 'general', 'zona' ],
+        'gmt_offset'                   => [ 'general', 'decimal' ],
+        'date_format'                  => [ 'general', 'texto' ],
+        'time_format'                  => [ 'general', 'texto' ],
+        'start_of_week'                => [ 'general', 'entero', [ 0, 6 ] ],
+        'WPLANG'                       => [ 'general', 'idioma' ],
+        'default_category'             => [ 'escritura', 'categoria' ],
+        'default_post_format'          => [ 'escritura', 'formato' ],
+        'show_on_front'                => [ 'lectura', 'lista', [ 'posts', 'page' ] ],
+        'page_on_front'                => [ 'lectura', 'pagina' ],
+        'page_for_posts'               => [ 'lectura', 'pagina' ],
+        'posts_per_page'               => [ 'lectura', 'entero', [ 1, 100 ] ],
+        'posts_per_rss'                => [ 'lectura', 'entero', [ 1, 100 ] ],
+        'rss_use_excerpt'              => [ 'lectura', 'si_no' ],
+        'blog_public'                  => [ 'lectura', 'si_no' ],
+        'default_pingback_flag'        => [ 'comentarios', 'si_no' ],
+        'default_ping_status'          => [ 'comentarios', 'lista', [ 'open', 'closed' ] ],
+        'default_comment_status'       => [ 'comentarios', 'lista', [ 'open', 'closed' ] ],
+        'require_name_email'           => [ 'comentarios', 'si_no' ],
+        'comment_registration'         => [ 'comentarios', 'si_no' ],
+        'close_comments_for_old_posts' => [ 'comentarios', 'si_no' ],
+        'close_comments_days_old'      => [ 'comentarios', 'entero', [ 0, 36500 ] ],
+        'show_comments_cookies_opt_in' => [ 'comentarios', 'si_no' ],
+        'thread_comments'              => [ 'comentarios', 'si_no' ],
+        'thread_comments_depth'        => [ 'comentarios', 'entero', [ 2, 10 ] ],
+        'page_comments'                => [ 'comentarios', 'si_no' ],
+        'comments_per_page'            => [ 'comentarios', 'entero', [ 1, 1000 ] ],
+        'default_comments_page'        => [ 'comentarios', 'lista', [ 'newest', 'oldest' ] ],
+        'comment_order'                => [ 'comentarios', 'lista', [ 'asc', 'desc' ] ],
+        'comments_notify'              => [ 'comentarios', 'si_no' ],
+        'moderation_notify'            => [ 'comentarios', 'si_no' ],
+        'comment_moderation'           => [ 'comentarios', 'si_no' ],
+        'comment_previously_approved'  => [ 'comentarios', 'si_no' ],
+        'comment_max_links'            => [ 'comentarios', 'entero', [ 0, 100 ] ],
+        'moderation_keys'              => [ 'comentarios', 'textarea' ],
+        'disallowed_keys'              => [ 'comentarios', 'textarea' ],
+        'show_avatars'                 => [ 'comentarios', 'si_no' ],
+        'avatar_rating'                => [ 'comentarios', 'lista', [ 'G', 'PG', 'R', 'X' ] ],
+        'avatar_default'               => [ 'comentarios', 'lista', [ 'mystery', 'blank', 'gravatar_default', 'identicon', 'wavatar', 'monsterid', 'retro' ] ],
+        'thumbnail_size_w'             => [ 'medios', 'entero', [ 0, 10000 ] ],
+        'thumbnail_size_h'             => [ 'medios', 'entero', [ 0, 10000 ] ],
+        'thumbnail_crop'               => [ 'medios', 'si_no' ],
+        'medium_size_w'                => [ 'medios', 'entero', [ 0, 10000 ] ],
+        'medium_size_h'                => [ 'medios', 'entero', [ 0, 10000 ] ],
+        'large_size_w'                 => [ 'medios', 'entero', [ 0, 10000 ] ],
+        'large_size_h'                 => [ 'medios', 'entero', [ 0, 10000 ] ],
+        'uploads_use_yearmonth_folders' => [ 'medios', 'si_no' ],
+        'permalink_structure'          => [ 'enlaces', 'enlace' ],
+        'category_base'                => [ 'enlaces', 'base' ],
+        'tag_base'                     => [ 'enlaces', 'base' ],
+        'wp_page_for_privacy_policy'   => [ 'privacidad', 'pagina' ],
+    ];
+
+    /** Lo que no se toca nunca por aquí, y por qué. */
+    const AJUSTES_BLOQUEADOS = [
+        'home'              => 'la dirección de la web: un error la deja inaccesible. Se cambia desde el escritorio o el panel del hosting.',
+        'siteurl'           => 'la dirección de WordPress: un error deja la web inaccesible. Se cambia desde el escritorio o el panel del hosting.',
+        'admin_email'       => 'el email del administrador: WordPress pide confirmarlo desde ese correo. Lo cambia la persona en Ajustes → Generales.',
+        'new_admin_email'   => 'el email del administrador: lo cambia la persona en Ajustes → Generales.',
+        'users_can_register' => 'abrir el registro de usuarios es un permiso de cuentas: lo decide y lo cambia la persona.',
+        'default_role'      => 'el rol de los usuarios nuevos es un permiso de cuentas: lo decide y lo cambia la persona.',
+    ];
+
+    private function claude_puede_ajustes() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new \WP_Error( 'co_sin_ajustes', 'Los ajustes de WordPress solo los toca un Administrador.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    private static function claude_ajuste_valor( $clave ) {
+        $v = get_option( $clave, '' );
+        $tipo = self::AJUSTES[ $clave ][1];
+        if ( 'si_no' === $tipo ) return (bool) $v;
+        if ( in_array( $tipo, [ 'entero', 'pagina', 'categoria' ], true ) ) return (int) $v;
+        if ( 'decimal' === $tipo ) return (float) $v;
+        return is_scalar( $v ) ? (string) $v : '';
+    }
+
+    private static function claude_ajustes_todos() {
+        $out = [];
+        foreach ( array_keys( self::AJUSTES ) as $k ) $out[ $k ] = self::claude_ajuste_valor( $k );
+        return $out;
+    }
+
+    private static function claude_ajustes_huella( $valores ) {
+        return substr( md5( (string) wp_json_encode( $valores ) ), 0, 12 );
+    }
+
+    /** Cómo quedaría la dirección de la última entrada con una estructura de enlaces permanentes. */
+    private static function claude_ajustes_ejemplo( $estructura ) {
+        $p = get_posts( [ 'post_type' => 'post', 'post_status' => 'publish', 'numberposts' => 1, 'suppress_filters' => true ] );
+        $p = $p ? $p[0] : null;
+        $base = untrailingslashit( home_url() );
+        if ( ! $p ) return null;
+        if ( '' === $estructura ) return $base . '/?p=' . $p->ID;
+        $t = strtotime( $p->post_date );
+        $cats = get_the_category( $p->ID );
+        $autor = get_userdata( $p->post_author );
+        $rep = [
+            '%year%' => date( 'Y', $t ), '%monthnum%' => date( 'm', $t ), '%day%' => date( 'd', $t ),
+            '%hour%' => date( 'H', $t ), '%minute%' => date( 'i', $t ), '%second%' => date( 's', $t ),
+            '%post_id%' => $p->ID, '%postname%' => $p->post_name,
+            '%category%' => $cats ? $cats[0]->slug : 'sin-categoria',
+            '%author%' => $autor && ! empty( $autor->user_nicename ) ? $autor->user_nicename : 'autor',
+        ];
+        return [ 'entrada' => $p->post_title, 'url' => $base . strtr( $estructura, $rep ) ];
+    }
+
+    /** GET /ajustes: las opciones por pantalla, la «version», lo bloqueado y un ejemplo de enlace permanente. */
+    public function claude_ajustes( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_ajustes();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $valores = self::claude_ajustes_todos();
+        $pantallas = [];
+        foreach ( self::AJUSTES as $k => $def ) $pantallas[ $def[0] ][ $k ] = $valores[ $k ];
+        return [
+            'version'    => self::claude_ajustes_huella( $valores ),
+            'ajustes'    => $pantallas,
+            'direccion'  => [ 'home' => get_option( 'home' ), 'siteurl' => get_option( 'siteurl' ) ],
+            'idiomas_instalados' => array_values( (array) get_available_languages() ),
+            'enlace_ejemplo' => self::claude_ajustes_ejemplo( (string) $valores['permalink_structure'] ),
+            'bloqueados' => self::AJUSTES_BLOQUEADOS,
+        ];
+    }
+
+    /** Comprueba y normaliza un valor según su tipo. */
+    private static function claude_ajuste_validar( $clave, $v ) {
+        $def = self::AJUSTES[ $clave ];
+        $mal = function ( $msg ) use ( $clave ) { return new \WP_Error( 'co_ajuste', '«' . $clave . '»: ' . $msg, [ 'status' => 400 ] ); };
+        switch ( $def[1] ) {
+            case 'texto':
+                if ( ! is_scalar( $v ) ) return $mal( 'tiene que ser un texto.' );
+                return sanitize_text_field( (string) $v );
+            case 'textarea':
+                if ( ! is_scalar( $v ) ) return $mal( 'tiene que ser un texto.' );
+                return implode( "\n", array_map( 'sanitize_text_field', explode( "\n", (string) $v ) ) );
+            case 'entero':
+                if ( ! is_numeric( $v ) || (int) $v != $v ) return $mal( 'tiene que ser un número entero.' );
+                if ( (int) $v < $def[2][0] || (int) $v > $def[2][1] ) return $mal( 'va de ' . $def[2][0] . ' a ' . $def[2][1] . '.' );
+                return (int) $v;
+            case 'decimal':
+                if ( ! is_numeric( $v ) || abs( (float) $v ) > 14 ) return $mal( 'es un desfase horario en horas, de -12 a 14.' );
+                return (float) $v;
+            case 'si_no':
+                if ( ! is_bool( $v ) && ! in_array( $v, [ 0, 1, '0', '1' ], true ) ) return $mal( 'es true o false.' );
+                return $v ? 1 : 0;
+            case 'lista':
+                if ( ! in_array( $v, $def[2], true ) ) return $mal( 'vale ' . implode( ', ', $def[2] ) . '.' );
+                return $v;
+            case 'pagina':
+                if ( ! is_numeric( $v ) ) return $mal( 'es el id de una página (0 para ninguna).' );
+                if ( (int) $v ) {
+                    $p = get_post( (int) $v );
+                    if ( ! $p || 'page' !== $p->post_type || 'publish' !== $p->post_status ) return $mal( 'no hay ninguna página publicada con el id ' . (int) $v . '.' );
+                }
+                return (int) $v;
+            case 'categoria':
+                $t = get_term( (int) $v, 'category' );
+                if ( ! $t || is_wp_error( $t ) ) return $mal( 'no hay ninguna categoría con el id ' . (int) $v . '.' );
+                return (int) $v;
+            case 'zona':
+                if ( '' !== $v && ! in_array( $v, timezone_identifiers_list(), true ) ) return $mal( 'no es una zona horaria (p. ej. Europe/Madrid), o "" para usar gmt_offset.' );
+                return (string) $v;
+            case 'idioma':
+                if ( '' !== $v && ! in_array( $v, (array) get_available_languages(), true ) ) return $mal( 'ese idioma no está instalado en la web («idiomas_instalados»; "" es inglés).' );
+                return (string) $v;
+            case 'formato':
+                $f = get_post_format_strings();
+                if ( '0' !== (string) $v && ! isset( $f[ $v ] ) ) return $mal( 'vale 0 (estándar) o ' . implode( ', ', array_keys( $f ) ) . '.' );
+                return (string) $v;
+            case 'enlace':
+                $v = trim( (string) $v );
+                if ( '' !== $v ) {
+                    if ( '/' !== $v[0] ) $v = '/' . $v;
+                    if ( ! preg_match( '/%(postname|post_id)%/', $v ) ) return $mal( 'tiene que llevar %postname% o %post_id% (o "" para los enlaces simples ?p=123).' );
+                    if ( preg_match( '#[^A-Za-z0-9_%/.-]#', $v ) ) return $mal( 'solo letras, números, -, _, . y etiquetas como %postname%.' );
+                }
+                return $v;
+            case 'base':
+                $v = trim( (string) $v, " /" );
+                if ( '' !== $v && ! preg_match( '#^[A-Za-z0-9_/-]+$#', $v ) ) return $mal( 'solo letras, números, - y _ (o "" para la de WordPress).' );
+                return $v;
+        }
+        return $mal( 'tipo desconocido.' );
+    }
+
+    /**
+     * POST /ajustes {version, ajustes:{opción: valor}, probar?, confirmar?}.
+     * Se comprueban todos antes de guardar ninguno.
+     */
+    public function claude_ajustes_guardar( \WP_REST_Request $request ) {
+        global $wp_rewrite;
+        $ok = $this->claude_puede_ajustes();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $p = (array) $request->get_json_params();
+        $antes = self::claude_ajustes_todos();
+        $v = (string) ( $p['version'] ?? '' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» de los ajustes (la da GET /ajustes).', [ 'status' => 428 ] );
+        if ( $v !== self::claude_ajustes_huella( $antes ) ) return new \WP_Error( 'co_cambiada', 'Los ajustes han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
+        $pedidos = $p['ajustes'] ?? null;
+        if ( ! is_array( $pedidos ) || ! $pedidos ) return new \WP_Error( 'co_ajuste', 'Faltan los «ajustes» que cambiar: {opción: valor}.', [ 'status' => 400 ] );
+
+        $nuevos = [];
+        foreach ( $pedidos as $k => $val ) {
+            if ( isset( self::AJUSTES_BLOQUEADOS[ $k ] ) ) return new \WP_Error( 'co_ajuste_bloqueado', '«' . $k . '» no se cambia por aquí: ' . self::AJUSTES_BLOQUEADOS[ $k ], [ 'status' => 403 ] );
+            if ( ! isset( self::AJUSTES[ $k ] ) ) return new \WP_Error( 'co_ajuste', '«' . $k . '» no está entre los ajustes que se pueden cambiar (los da GET /ajustes).', [ 'status' => 400 ] );
+            $n = self::claude_ajuste_validar( $k, $val );
+            if ( is_wp_error( $n ) ) return $n;
+            $nuevos[ $k ] = $n;
+        }
+        // Coherencia de la portada: una página estática necesita página (solo si se toca la portada).
+        $toca_portada = (bool) array_intersect_key( $nuevos, array_flip( [ 'show_on_front', 'page_on_front', 'page_for_posts' ] ) );
+        $mostrar = $nuevos['show_on_front'] ?? $antes['show_on_front'];
+        $portada = $nuevos['page_on_front'] ?? $antes['page_on_front'];
+        $blog    = $nuevos['page_for_posts'] ?? $antes['page_for_posts'];
+        if ( $toca_portada && 'page' === $mostrar && ! $portada ) return new \WP_Error( 'co_ajuste', 'Con show_on_front = page hace falta «page_on_front» (la página de portada).', [ 'status' => 400 ] );
+        if ( $toca_portada && 'page' === $mostrar && $portada && $portada === $blog ) return new \WP_Error( 'co_ajuste', 'La portada y la página de entradas no pueden ser la misma página.', [ 'status' => 400 ] );
+
+        $cambios = [];
+        foreach ( $nuevos as $k => $n ) {
+            $a = $antes[ $k ];
+            $mismo = 'si_no' === self::AJUSTES[ $k ][1] ? (bool) $a === (bool) $n : (string) $a === (string) $n;
+            if ( ! $mismo ) $cambios[ $k ] = [ 'antes' => $a, 'despues' => 'si_no' === self::AJUSTES[ $k ][1] ? (bool) $n : $n ];
+        }
+        $enlaces = (bool) array_intersect_key( $cambios, array_flip( [ 'permalink_structure', 'category_base', 'tag_base' ] ) );
+        $delicados = [];
+        if ( $enlaces ) $delicados[] = 'cambian los enlaces permanentes: las direcciones que ya están en Google, redes o enlaces de otras webs dejan de llevar a su sitio si no hay redirecciones';
+        if ( isset( $cambios['blog_public'] ) && ! $cambios['blog_public']['despues'] ) $delicados[] = 'la web pide a los buscadores que no la indexen';
+        $respuesta = [
+            'cambios'  => (object) $cambios,
+            'avisos'   => $delicados,
+            'enlace_ejemplo' => $enlaces ? [
+                'antes'   => self::claude_ajustes_ejemplo( (string) $antes['permalink_structure'] ),
+                'despues' => self::claude_ajustes_ejemplo( (string) ( $nuevos['permalink_structure'] ?? $antes['permalink_structure'] ) ),
+            ] : null,
+        ];
+        if ( ! empty( $p['probar'] ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => self::claude_ajustes_huella( $antes ) ];
+        }
+        if ( $delicados && empty( $p['confirmar'] ) ) {
+            return new \WP_Error( 'co_ajuste_confirmar', 'Este cambio necesita «confirmar»: ' . implode( '; ', $delicados ) . '. Enséñaselo a la persona (con «probar» sale el ejemplo) y repite con confirmar=true solo con su visto bueno.', [ 'status' => 412 ] );
+        }
+
+        foreach ( $cambios as $k => $c ) {
+            if ( in_array( $k, [ 'permalink_structure', 'category_base', 'tag_base' ], true ) ) continue;
+            update_option( $k, $nuevos[ $k ] );
+        }
+        if ( $enlaces ) {
+            if ( isset( $cambios['permalink_structure'] ) ) $wp_rewrite->set_permalink_structure( $nuevos['permalink_structure'] );
+            if ( isset( $cambios['category_base'] ) ) $wp_rewrite->set_category_base( $nuevos['category_base'] );
+            if ( isset( $cambios['tag_base'] ) ) $wp_rewrite->set_tag_base( $nuevos['tag_base'] );
+            flush_rewrite_rules();
+        }
+        $this->claude_registrar( 'ajustes', 0, implode( ', ', array_keys( $cambios ) ) );
+        return $respuesta + [ 'guardado' => true, 'version' => self::claude_ajustes_huella( self::claude_ajustes_todos() ) ];
     }
 
     // ── Piezas internas ───────────────────────────────────────
