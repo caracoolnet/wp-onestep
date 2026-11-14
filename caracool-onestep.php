@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.3
+ * Version:     1.5.4
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.3' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.4' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1874,6 +1874,20 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/codigos/papelera', [
             [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_codigos_papelera' ], 'permission_callback' => $perm ],
         ] );
+        // 1.5.4: menús de WordPress, conservando los ajustes extra de cada elemento.
+        register_rest_route( $ns, '/menus', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_menus' ], 'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_menu_crear' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/menus/(?P<menu>\d+)', [
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_menu_cambiar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/menus/papelera', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_menus_papelera' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/menus/papelera/(?P<i>\d+)', [
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_menu_restaurar' ], 'permission_callback' => $perm ],
+        ] );
     }
 
     /**
@@ -2758,6 +2772,641 @@ class Caracool_OneStep {
             $out[] = [ 'fecha' => $e['fecha'] ?? '' ] + self::claude_codigo_salida( $k, (array) ( $e['codigo'] ?? [] ) );
         }
         return $out;
+    }
+
+    // ── Menús de WordPress (1.5.4) ────────────────────────────
+    // Leer, crear y cambiar menús sin perder lo que cada elemento lleva de
+    // más: los ajustes que guardan el tema o los plugins en el meta del
+    // elemento (iconos, megamenús, visibilidad…). La REST normal y el
+    // editor de menús los pierden con facilidad cuando se rehace un menú;
+    // aquí los elementos existentes se tocan campo a campo, nunca se borran
+    // y recrean, y al final se compara su meta con la de antes y se
+    // restaura lo que algún gancho haya cambiado. Los elementos quitados
+    // van a la papelera de WordPress y, además, a una copia completa en la
+    // papelera de menús de OneStep (los últimos 50), de donde se restauran.
+
+    const MENUS_PAPELERA = 'caracool_onestep_menus_papelera';
+
+    /** Meta que pertenece a WordPress; el resto de claves son ajustes extra. */
+    const MENU_META_WP = [
+        '_menu_item_type', '_menu_item_menu_item_parent', '_menu_item_object_id', '_menu_item_object',
+        '_menu_item_target', '_menu_item_classes', '_menu_item_xfn', '_menu_item_url', '_menu_item_orphaned',
+        '_edit_lock', '_edit_last', '_wp_old_date', '_wp_old_slug', '_wp_desired_post_slug',
+        '_wp_trash_meta_status', '_wp_trash_meta_time',
+    ];
+
+    private function claude_puede_menus() {
+        if ( ! current_user_can( 'edit_theme_options' ) ) {
+            return new \WP_Error( 'co_sin_menus', 'Los menús solo los toca un usuario que pueda editar la apariencia (Administrador).', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    /** Todo el meta de un elemento: clave => lista de valores ya deserializados. */
+    private static function claude_menu_metas( $id ) {
+        $out = [];
+        foreach ( (array) get_post_custom( $id ) as $k => $vals ) {
+            $out[ $k ] = array_map( 'maybe_unserialize', array_values( (array) $vals ) );
+        }
+        ksort( $out );
+        return $out;
+    }
+
+    private static function claude_menu_extra( $metas ) {
+        $extra = array_diff_key( $metas, array_flip( self::MENU_META_WP ) );
+        $out = [];
+        foreach ( $extra as $k => $vals ) $out[ $k ] = 1 === count( $vals ) ? $vals[0] : $vals;
+        return $out;
+    }
+
+    /** Elementos publicados de un menú, en orden, ya preparados por WordPress. */
+    private function claude_menu_items( $menu_id ) {
+        $posts = get_posts( [
+            'post_type'        => 'nav_menu_item',
+            'post_status'      => 'publish',
+            'numberposts'      => -1,
+            'orderby'          => 'menu_order',
+            'order'            => 'ASC',
+            'suppress_filters' => true,
+            'tax_query'        => [ [ 'taxonomy' => 'nav_menu', 'field' => 'term_id', 'terms' => (int) $menu_id ] ],
+        ] );
+        $out = [];
+        foreach ( (array) $posts as $p ) {
+            $out[ (int) $p->ID ] = wp_setup_nav_menu_item( $p );
+        }
+        return $out;
+    }
+
+    private static function claude_menu_item_salida( $it, $metas ) {
+        return [
+            'id'             => (int) $it->ID,
+            'titulo'         => (string) $it->title,
+            'titulo_propio'  => (string) $it->post_title,
+            'tipo'           => (string) $it->type,
+            'objeto'         => (string) $it->object,
+            'objeto_id'      => (int) $it->object_id,
+            'url'            => (string) $it->url,
+            'padre'          => (int) $it->menu_item_parent,
+            'orden'          => (int) $it->menu_order,
+            'destino'        => (string) $it->target,
+            'clases'         => array_values( array_filter( (array) $it->classes ) ),
+            'atributo_title' => (string) $it->attr_title,
+            'descripcion'    => (string) $it->post_content,
+            'roto'           => ! empty( $it->_invalid ),
+            'ajustes_extra'  => (object) self::claude_menu_extra( $metas ),
+        ];
+    }
+
+    private function claude_menu_ubicaciones_de( $menu_id ) {
+        $out = [];
+        foreach ( (array) get_nav_menu_locations() as $slug => $id ) {
+            if ( (int) $id === (int) $menu_id ) $out[] = (string) $slug;
+        }
+        return $out;
+    }
+
+    /** Un menú completo: elementos, ubicaciones, ajustes extra y su «version». */
+    private function claude_menu_leer( $menu ) {
+        $items = $this->claude_menu_items( $menu->term_id );
+        $salida = [];
+        $para_huella = [];
+        $con_extra = [];
+        foreach ( $items as $id => $it ) {
+            $metas = self::claude_menu_metas( $id );
+            $s = self::claude_menu_item_salida( $it, $metas );
+            $salida[] = $s;
+            $extra = (array) $s['ajustes_extra'];
+            if ( $extra ) $con_extra[] = [ 'id' => $id, 'titulo' => $s['titulo'], 'claves' => array_keys( $extra ) ];
+            $para_huella[] = [ $id, (int) $it->menu_order, $it->post_title, $it->post_content, $it->post_excerpt, $metas ];
+        }
+        $ubic = $this->claude_menu_ubicaciones_de( $menu->term_id );
+        $idioma = apply_filters( 'wpml_element_language_code', null, [ 'element_id' => (int) $menu->term_id, 'element_type' => 'nav_menu' ] );
+        return [
+            'id'          => (int) $menu->term_id,
+            'nombre'      => (string) $menu->name,
+            'slug'        => (string) $menu->slug,
+            'idioma'      => $idioma ? (string) $idioma : null,
+            'ubicaciones' => $ubic,
+            'version'     => substr( md5( (string) wp_json_encode( [ $menu->name, $ubic, $para_huella ] ) ), 0, 12 ),
+            'elementos'   => $salida,
+            // Lo que este MCP no sabe interpretar: se conserva siempre, pero para guardar hace falta «forzar».
+            'ajustes_desconocidos' => $con_extra,
+        ];
+    }
+
+    private function claude_menu_objeto( $id ) {
+        $menu = wp_get_nav_menu_object( (int) $id );
+        if ( ! $menu ) return new \WP_Error( 'co_menu', 'No hay ningún menú con el id ' . (int) $id . '.', [ 'status' => 404 ] );
+        return $menu;
+    }
+
+    /** GET /menus[?menu=id]: menús con sus elementos, las ubicaciones del tema y la papelera. */
+    public function claude_menus( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_menus();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $solo = (int) $request->get_param( 'menu' );
+        $locs = (array) get_nav_menu_locations();
+        $ubicaciones = [];
+        foreach ( (array) get_registered_nav_menus() as $slug => $nombre ) {
+            $ubicaciones[ $slug ] = [ 'nombre' => (string) $nombre, 'menu' => ! empty( $locs[ $slug ] ) ? (int) $locs[ $slug ] : null ];
+        }
+        $menus = [];
+        foreach ( (array) wp_get_nav_menus() as $m ) {
+            if ( $solo && (int) $m->term_id !== $solo ) continue;
+            $menus[] = $this->claude_menu_leer( $m );
+        }
+        if ( $solo && ! $menus ) return new \WP_Error( 'co_menu', 'No hay ningún menú con el id ' . $solo . '.', [ 'status' => 404 ] );
+        return [
+            'tema'        => get_stylesheet(),
+            'ubicaciones' => (object) $ubicaciones,
+            'menus'       => $menus,
+            'en_papelera' => count( (array) get_option( self::MENUS_PAPELERA, [] ) ),
+        ];
+    }
+
+    /**
+     * Comprueba unas ubicaciones para un menú. Quitarle una ubicación a otro
+     * menú cambia lo que se ve en la web: sin «sustituir» se para y lo dice.
+     */
+    private function claude_menu_ubicaciones_validas( $slugs, $menu_id, $sustituir ) {
+        $registradas = (array) get_registered_nav_menus();
+        $locs = (array) get_nav_menu_locations();
+        $slugs = array_values( array_unique( array_map( 'strval', (array) $slugs ) ) );
+        foreach ( $slugs as $s ) {
+            if ( ! isset( $registradas[ $s ] ) ) {
+                return new \WP_Error( 'co_menu', 'El tema no tiene la ubicación «' . $s . '». Tiene: ' . implode( ', ', array_keys( $registradas ) ) . '.', [ 'status' => 400 ] );
+            }
+            $otro = (int) ( $locs[ $s ] ?? 0 );
+            if ( $otro && $otro !== (int) $menu_id && ! $sustituir && wp_get_nav_menu_object( $otro ) ) {
+                $m = wp_get_nav_menu_object( $otro );
+                return new \WP_Error( 'co_menu_ubicacion_ocupada', 'La ubicación «' . $s . '» ya muestra el menú «' . $m->name . '» (id ' . $otro . '). Para sustituirlo, «sustituir».', [ 'status' => 409 ] );
+            }
+        }
+        return $slugs;
+    }
+
+    /** POST /menus {nombre, ubicaciones?, sustituir?}: crea un menú vacío y, si se pide, lo pone en esas ubicaciones. */
+    public function claude_menu_crear( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_menus();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $p = (array) $request->get_json_params();
+        $nombre = sanitize_text_field( (string) ( $p['nombre'] ?? '' ) );
+        if ( '' === $nombre ) return new \WP_Error( 'co_menu', 'El menú necesita un «nombre».', [ 'status' => 400 ] );
+        $ubic = isset( $p['ubicaciones'] ) ? (array) $p['ubicaciones'] : ( isset( $p['ubicacion'] ) ? [ $p['ubicacion'] ] : [] );
+        $ubic = $this->claude_menu_ubicaciones_validas( $ubic, 0, ! empty( $p['sustituir'] ) );
+        if ( is_wp_error( $ubic ) ) return $ubic;
+        $id = wp_create_nav_menu( $nombre );
+        if ( is_wp_error( $id ) ) return new \WP_Error( 'co_menu', 'No se ha podido crear el menú: ' . $id->get_error_message(), [ 'status' => 400 ] );
+        if ( $ubic ) {
+            $locs = (array) get_theme_mod( 'nav_menu_locations', [] );
+            foreach ( $ubic as $s ) $locs[ $s ] = (int) $id;
+            set_theme_mod( 'nav_menu_locations', $locs );
+        }
+        $this->claude_registrar( 'menu_crear', 0, $nombre . ( $ubic ? ' → ' . implode( ', ', $ubic ) : '' ) );
+        return $this->claude_menu_leer( wp_get_nav_menu_object( (int) $id ) );
+    }
+
+    /** Clave interna de un elemento: existente «e123», nuevo «n<ref>». */
+    private static function claude_menu_clave( $v ) {
+        if ( is_int( $v ) || ( is_string( $v ) && ctype_digit( $v ) ) ) return (int) $v ? 'e' . (int) $v : 0;
+        if ( is_string( $v ) && '' !== trim( $v ) ) return 'n' . trim( $v );
+        return null;
+    }
+
+    private static function claude_menu_clases( $v ) {
+        $v = is_array( $v ) ? $v : preg_split( '/\s+/', (string) $v );
+        return array_values( array_filter( array_map( 'sanitize_html_class', $v ) ) );
+    }
+
+    /**
+     * POST /menus/<id> {version, forzar?, operaciones:[…]}: cambia un menú.
+     * Las operaciones se comprueban todas antes de escribir nada:
+     *   añadir   {titulo?, objeto?, objeto_id?, url?, padre?, despues_de?, destino?, clases?, atributo_title?, descripcion?, ref?}
+     *   cambiar  {id, titulo?, url?, destino?, clases?, atributo_title?, descripcion?, padre?, despues_de?}
+     *   mover    {id, padre?, despues_de?}            (despues_de 0 = el primero de sus hermanos)
+     *   ordenar  {elementos:[{id, padre}]}            (todos, en el orden nuevo)
+     *   quitar   {id}                                 (sus hijos suben un nivel; va a la papelera)
+     *   renombrar {nombre}
+     *   ubicaciones {ubicaciones:[slug…], sustituir?} (las de este menú, exactas; sustituir para quitársela a otro menú)
+     * id, padre y despues_de admiten el «ref» de un elemento añadido en la misma llamada.
+     */
+    public function claude_menu_cambiar( \WP_REST_Request $request ) {
+        global $wpdb;
+        $ok = $this->claude_puede_menus();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $menu = $this->claude_menu_objeto( $request->get_param( 'menu' ) );
+        if ( is_wp_error( $menu ) ) return $menu;
+        $menu_id = (int) $menu->term_id;
+        $p = (array) $request->get_json_params();
+        $forzar = ! empty( $p['forzar'] );
+
+        $antes = $this->claude_menu_leer( $menu );
+        $v = (string) ( $p['version'] ?? '' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» del menú (la da GET /menus).', [ 'status' => 428 ] );
+        if ( $v !== $antes['version'] ) return new \WP_Error( 'co_cambiada', 'El menú ha cambiado desde que se leyó: vuelve a leerlo.', [ 'status' => 409, 'version' => $antes['version'] ] );
+        if ( $antes['ajustes_desconocidos'] && ! $forzar ) {
+            $lista = array_map( function ( $x ) { return '«' . $x['titulo'] . '» (' . $x['id'] . '): ' . implode( ', ', $x['claves'] ); }, $antes['ajustes_desconocidos'] );
+            return new \WP_Error( 'co_menu_ajustes_extra', 'Hay elementos con ajustes que esta herramienta no conoce (los pone el tema o un plugin): ' . implode( '; ', $lista ) . '. Se conservan igualmente, pero para guardar hay que decírselo a la persona y mandar «forzar».', [ 'status' => 412, 'ajustes_desconocidos' => $antes['ajustes_desconocidos'] ] );
+        }
+        $ops = $p['operaciones'] ?? [];
+        if ( ! is_array( $ops ) || ! $ops ) return new \WP_Error( 'co_menu', 'Faltan las «operaciones».', [ 'status' => 400 ] );
+
+        // Modelo en memoria: orden plano + padre de cada uno + campos.
+        $items = $this->claude_menu_items( $menu_id );
+        $orden = [];
+        $padre = [];
+        $campos = [];
+        foreach ( $items as $id => $it ) {
+            $k = 'e' . $id;
+            $orden[] = $k;
+            $padre[ $k ] = $it->menu_item_parent ? 'e' . (int) $it->menu_item_parent : 0;
+            $campos[ $k ] = [];
+        }
+        foreach ( $padre as $k => $pa ) if ( $pa && ! isset( $padre[ $pa ] ) ) $padre[ $k ] = 0; // padre que ya no está
+        $nuevos = [];
+        $quitados = [];
+        $nombre_nuevo = null;
+        $ubic_nuevas = null;
+
+        $err = function ( $n, $msg ) { return new \WP_Error( 'co_menu', 'Operación ' . ( $n + 1 ) . ': ' . $msg, [ 'status' => 400 ] ); };
+        $existe = function ( $k ) use ( &$padre ) { return $k && isset( $padre[ $k ] ); };
+        $desciende = function ( $k, $de ) use ( &$padre ) { // ¿$k está debajo de $de (o es él)?
+            for ( $i = 0; $k && $i < 500; $i++ ) { if ( $k === $de ) return true; $k = $padre[ $k ] ?? 0; }
+            return false;
+        };
+        $colocar = function ( $k, $o, $n ) use ( &$orden, &$padre, $existe, $desciende, $err ) {
+            $tiene_padre = array_key_exists( 'padre', $o );
+            $tiene_despues = array_key_exists( 'despues_de', $o );
+            if ( $tiene_padre ) {
+                $pa = self::claude_menu_clave( $o['padre'] );
+                if ( null === $pa || ( $pa && ! $existe( $pa ) ) ) return $err( $n, 'el «padre» no es un elemento de este menú.' );
+                if ( $pa && $desciende( $pa, $k ) ) return $err( $n, 'un elemento no puede colgar de sí mismo ni de uno de sus hijos.' );
+            }
+            if ( $tiene_despues ) {
+                $de = self::claude_menu_clave( $o['despues_de'] );
+                if ( null === $de || ( $de && ( ! $existe( $de ) || $de === $k ) ) ) return $err( $n, '«despues_de» no es otro elemento de este menú.' );
+                if ( ! $tiene_padre ) $pa = $de ? $padre[ $de ] : ( $padre[ $k ] ?? 0 );
+                if ( $de && $pa !== $padre[ $de ] ) return $err( $n, '«despues_de» tiene que ser un hermano (del mismo «padre»).' );
+            }
+            if ( $tiene_padre || $tiene_despues ) {
+                $padre[ $k ] = $pa;
+                $orden = array_values( array_diff( $orden, [ $k ] ) );
+                if ( $tiene_despues && $de ) {
+                    array_splice( $orden, array_search( $de, $orden, true ) + 1, 0, [ $k ] );
+                } elseif ( $tiene_despues ) {
+                    $pos = count( $orden );
+                    foreach ( $orden as $i => $x ) if ( $padre[ $x ] === $pa ) { $pos = $i; break; }
+                    array_splice( $orden, $pos, 0, [ $k ] );
+                } else {
+                    $orden[] = $k;
+                }
+            } elseif ( ! in_array( $k, $orden, true ) ) {
+                $padre[ $k ] = $padre[ $k ] ?? 0;
+                $orden[] = $k;
+            }
+            return true;
+        };
+        $leer_campos = function ( $o, $n, $es_enlace ) use ( $err ) {
+            $c = [];
+            if ( array_key_exists( 'titulo', $o ) ) $c['titulo'] = sanitize_text_field( (string) $o['titulo'] );
+            if ( array_key_exists( 'url', $o ) ) {
+                if ( ! $es_enlace ) return $err( $n, 'solo se cambia la «url» de un enlace personalizado; los demás la toman de su página o categoría.' );
+                $c['url'] = esc_url_raw( (string) $o['url'] );
+                if ( '' === $c['url'] ) return $err( $n, 'la «url» no es válida.' );
+            }
+            if ( array_key_exists( 'destino', $o ) ) {
+                if ( ! in_array( $o['destino'], [ '', '_blank' ], true ) ) return $err( $n, '«destino» es "" o "_blank".' );
+                $c['destino'] = $o['destino'];
+            }
+            if ( array_key_exists( 'clases', $o ) ) $c['clases'] = self::claude_menu_clases( $o['clases'] );
+            if ( array_key_exists( 'atributo_title', $o ) ) $c['atributo_title'] = sanitize_text_field( (string) $o['atributo_title'] );
+            if ( array_key_exists( 'descripcion', $o ) ) $c['descripcion'] = sanitize_text_field( (string) $o['descripcion'] );
+            return $c;
+        };
+
+        foreach ( array_values( $ops ) as $n => $o ) {
+            $o = (array) $o;
+            $accion = (string) ( $o['accion'] ?? '' );
+            if ( 'anadir' === $accion ) $accion = 'añadir';
+            switch ( $accion ) {
+                case 'añadir':
+                    $ref = isset( $o['ref'] ) && '' !== (string) $o['ref'] ? (string) $o['ref'] : '#' . $n;
+                    if ( ctype_digit( $ref ) ) return $err( $n, 'el «ref» no puede ser un número.' );
+                    $k = 'n' . $ref;
+                    if ( isset( $padre[ $k ] ) ) return $err( $n, 'el «ref» «' . $ref . '» está repetido.' );
+                    $obj_id = (int) ( $o['objeto_id'] ?? 0 );
+                    $objeto = (string) ( $o['objeto'] ?? ( $obj_id ? 'page' : 'custom' ) );
+                    if ( $obj_id ) {
+                        if ( post_type_exists( $objeto ) ) {
+                            $post = get_post( $obj_id );
+                            if ( ! $post || $post->post_type !== $objeto ) return $err( $n, 'no hay ningún ' . $objeto . ' con el id ' . $obj_id . '.' );
+                            $tipo = 'post_type';
+                        } elseif ( taxonomy_exists( $objeto ) ) {
+                            $term = get_term( $obj_id, $objeto );
+                            if ( ! $term || is_wp_error( $term ) ) return $err( $n, 'no hay ningún término de ' . $objeto . ' con el id ' . $obj_id . '.' );
+                            $tipo = 'taxonomy';
+                        } else {
+                            return $err( $n, '«objeto» tiene que ser un tipo de contenido (page, post, product…) o una taxonomía (category, product_cat…).' );
+                        }
+                    } else {
+                        if ( empty( $o['url'] ) ) return $err( $n, 'para añadir hace falta «objeto_id» (una página, entrada o categoría) o una «url».' );
+                        if ( '' === trim( (string) ( $o['titulo'] ?? '' ) ) ) return $err( $n, 'un enlace personalizado necesita «titulo».' );
+                        $objeto = 'custom';
+                        $tipo = 'custom';
+                    }
+                    $c = $leer_campos( $o, $n, 'custom' === $tipo );
+                    if ( is_wp_error( $c ) ) return $c;
+                    $padre[ $k ] = 0;
+                    $r = $colocar( $k, $o, $n );
+                    if ( is_wp_error( $r ) ) { unset( $padre[ $k ] ); return $r; }
+                    $nuevos[ $k ] = [ 'ref' => $ref, 'tipo' => $tipo, 'objeto' => $objeto, 'objeto_id' => $obj_id ];
+                    $campos[ $k ] = $c;
+                    break;
+
+                case 'cambiar':
+                case 'mover':
+                    $k = self::claude_menu_clave( $o['id'] ?? null );
+                    if ( ! $existe( $k ) ) return $err( $n, 'el «id» no es un elemento de este menú.' );
+                    if ( 'cambiar' === $accion ) {
+                        $es_enlace = isset( $nuevos[ $k ] ) ? 'custom' === $nuevos[ $k ]['tipo'] : 'custom' === $items[ (int) substr( $k, 1 ) ]->type;
+                        $c = $leer_campos( $o, $n, $es_enlace );
+                        if ( is_wp_error( $c ) ) return $c;
+                        $campos[ $k ] = array_merge( $campos[ $k ], $c );
+                    }
+                    $r = $colocar( $k, $o, $n );
+                    if ( is_wp_error( $r ) ) return $r;
+                    break;
+
+                case 'ordenar':
+                    $lista = $o['elementos'] ?? null;
+                    if ( ! is_array( $lista ) ) return $err( $n, '«elementos» es la lista completa [{id, padre}] en el orden nuevo.' );
+                    $nuevo_orden = [];
+                    $nuevo_padre = [];
+                    foreach ( $lista as $x ) {
+                        $x = (array) $x;
+                        $k = self::claude_menu_clave( $x['id'] ?? null );
+                        if ( ! $existe( $k ) || isset( $nuevo_padre[ $k ] ) ) return $err( $n, 'en «elementos» hay un id que no es de este menú o está repetido.' );
+                        $pa = self::claude_menu_clave( $x['padre'] ?? 0 );
+                        if ( null === $pa || ( $pa && ! $existe( $pa ) ) ) return $err( $n, 'en «elementos» hay un padre que no es de este menú.' );
+                        $nuevo_orden[] = $k;
+                        $nuevo_padre[ $k ] = $pa;
+                    }
+                    if ( count( $nuevo_orden ) !== count( $orden ) ) return $err( $n, '«elementos» tiene que traerlos todos (' . count( $orden ) . '), no ' . count( $nuevo_orden ) . '.' );
+                    foreach ( $nuevo_padre as $k => $pa ) {
+                        for ( $i = 0, $x = $pa; $x && $i < 500; $i++ ) { if ( $x === $k ) return $err( $n, 'en «elementos» hay un elemento que cuelga de sí mismo.' ); $x = $nuevo_padre[ $x ] ?? 0; }
+                    }
+                    $orden = $nuevo_orden;
+                    $padre = $nuevo_padre;
+                    break;
+
+                case 'quitar':
+                    $k = self::claude_menu_clave( $o['id'] ?? null );
+                    if ( ! $existe( $k ) ) return $err( $n, 'el «id» no es un elemento de este menú.' );
+                    foreach ( $padre as $h => $pa ) if ( $pa === $k ) $padre[ $h ] = $padre[ $k ];
+                    $orden = array_values( array_diff( $orden, [ $k ] ) );
+                    unset( $padre[ $k ] );
+                    if ( isset( $nuevos[ $k ] ) ) { unset( $nuevos[ $k ], $campos[ $k ] ); } else { $quitados[] = (int) substr( $k, 1 ); }
+                    break;
+
+                case 'renombrar':
+                    $nombre_nuevo = sanitize_text_field( (string) ( $o['nombre'] ?? '' ) );
+                    if ( '' === $nombre_nuevo ) return $err( $n, 'falta el «nombre».' );
+                    foreach ( (array) wp_get_nav_menus() as $m ) {
+                        if ( (int) $m->term_id !== $menu_id && 0 === strcasecmp( $m->name, $nombre_nuevo ) ) return $err( $n, 'ya hay otro menú que se llama «' . $nombre_nuevo . '».' );
+                    }
+                    break;
+
+                case 'ubicaciones':
+                    $u = $this->claude_menu_ubicaciones_validas( $o['ubicaciones'] ?? [], $menu_id, ! empty( $o['sustituir'] ) );
+                    if ( is_wp_error( $u ) ) return new \WP_Error( $u->get_error_code(), 'Operación ' . ( $n + 1 ) . ': ' . $u->get_error_message(), $u->data );
+                    $ubic_nuevas = $u;
+                    break;
+
+                default:
+                    return $err( $n, '«accion» es añadir, cambiar, mover, ordenar, quitar, renombrar o ubicaciones.' );
+            }
+        }
+
+        // Orden final: en profundidad, cada padre seguido de sus hijos en el orden del modelo.
+        $hijos = [];
+        foreach ( $orden as $k ) $hijos[ $padre[ $k ] && isset( $padre[ $padre[ $k ] ] ) ? $padre[ $k ] : 0 ][] = $k;
+        $final = [];
+        $recorrer = function ( $pa ) use ( &$recorrer, &$hijos, &$final ) {
+            foreach ( $hijos[ $pa ] ?? [] as $k ) { $final[] = $k; $recorrer( $k ); }
+        };
+        $recorrer( 0 );
+
+        // ── A partir de aquí se escribe ──
+        $metas_antes = [];
+        foreach ( $items as $id => $it ) $metas_antes[ $id ] = self::claude_menu_metas( $id );
+
+        // 1. Lo quitado: copia completa a la papelera de OneStep y el elemento a la papelera de WordPress.
+        if ( $quitados ) {
+            $papelera = (array) get_option( self::MENUS_PAPELERA, [] );
+            foreach ( $quitados as $id ) {
+                $it = $items[ $id ];
+                array_unshift( $papelera, [
+                    'fecha'       => current_time( 'mysql' ),
+                    'menu'        => $menu_id,
+                    'menu_nombre' => (string) $menu->name,
+                    'id'          => $id,
+                    'padre'       => (int) $it->menu_item_parent,
+                    'post'        => [ 'post_title' => $it->post_title, 'post_content' => $it->post_content, 'post_excerpt' => $it->post_excerpt, 'menu_order' => (int) $it->menu_order ],
+                    'metas'       => $metas_antes[ $id ],
+                    'elemento'    => self::claude_menu_item_salida( $it, $metas_antes[ $id ] ),
+                ] );
+                $wpdb->update( $wpdb->posts, [ 'post_status' => 'trash' ], [ 'ID' => $id ] );
+                update_post_meta( $id, '_wp_trash_meta_status', 'publish' );
+                update_post_meta( $id, '_wp_trash_meta_time', time() );
+                clean_post_cache( $id );
+            }
+            update_option( self::MENUS_PAPELERA, array_slice( $papelera, 0, 50 ), false );
+        }
+
+        // 2. Lo nuevo, con la función de WordPress (no tiene nada que perder).
+        $ids = [];
+        foreach ( $items as $id => $it ) $ids[ 'e' . $id ] = $id;
+        foreach ( $final as $k ) {
+            if ( ! isset( $nuevos[ $k ] ) ) continue;
+            $nv = $nuevos[ $k ];
+            $c = $campos[ $k ];
+            $nid = wp_update_nav_menu_item( $menu_id, 0, [
+                'menu-item-type'        => $nv['tipo'],
+                'menu-item-object'      => $nv['objeto'],
+                'menu-item-object-id'   => $nv['objeto_id'],
+                'menu-item-title'       => $c['titulo'] ?? '',
+                'menu-item-url'         => $c['url'] ?? '',
+                'menu-item-target'      => $c['destino'] ?? '',
+                'menu-item-classes'     => implode( ' ', $c['clases'] ?? [] ),
+                'menu-item-attr-title'  => $c['atributo_title'] ?? '',
+                'menu-item-description' => $c['descripcion'] ?? '',
+                'menu-item-status'      => 'publish',
+            ] );
+            if ( is_wp_error( $nid ) || ! $nid ) {
+                return new \WP_Error( 'co_menu', 'No se ha podido añadir «' . ( $c['titulo'] ?? $nv['ref'] ) . '»' . ( is_wp_error( $nid ) ? ': ' . $nid->get_error_message() : '' ) . '. Lo anterior a este paso sí se ha guardado: vuelve a leer el menú.', [ 'status' => 500 ] );
+            }
+            $ids[ $k ] = (int) $nid;
+        }
+
+        // 3. Orden, padre y campos, uno a uno y solo donde cambian (sin rehacer nada).
+        foreach ( $final as $i => $k ) {
+            $id = $ids[ $k ];
+            $orden_nuevo = $i + 1;
+            $pa = $padre[ $k ] && isset( $ids[ $padre[ $k ] ] ) ? $ids[ $padre[ $k ] ] : 0;
+            $c = $campos[ $k ];
+            $post = [];
+            if ( isset( $nuevos[ $k ] ) ) {
+                $post['menu_order'] = $orden_nuevo;
+            } else {
+                $it = $items[ $id ];
+                if ( (int) $it->menu_order !== $orden_nuevo ) $post['menu_order'] = $orden_nuevo;
+                if ( array_key_exists( 'titulo', $c ) && $c['titulo'] !== $it->post_title ) $post['post_title'] = $c['titulo'];
+                if ( array_key_exists( 'atributo_title', $c ) ) $post['post_excerpt'] = $c['atributo_title'];
+                if ( array_key_exists( 'descripcion', $c ) ) $post['post_content'] = $c['descripcion'];
+                if ( array_key_exists( 'url', $c ) ) update_post_meta( $id, '_menu_item_url', $c['url'] );
+                if ( array_key_exists( 'destino', $c ) ) update_post_meta( $id, '_menu_item_target', $c['destino'] );
+                if ( array_key_exists( 'clases', $c ) ) update_post_meta( $id, '_menu_item_classes', $c['clases'] ?: [ '' ] );
+            }
+            if ( (string) $pa !== (string) get_post_meta( $id, '_menu_item_menu_item_parent', true ) ) update_post_meta( $id, '_menu_item_menu_item_parent', (string) $pa );
+            if ( $post ) $wpdb->update( $wpdb->posts, $post, [ 'ID' => $id ] );
+            clean_post_cache( $id );
+        }
+
+        // 4. Nombre y ubicaciones del menú.
+        if ( null !== $nombre_nuevo && $nombre_nuevo !== $menu->name ) {
+            $r = wp_update_nav_menu_object( $menu_id, [ 'menu-name' => $nombre_nuevo ] );
+            if ( is_wp_error( $r ) ) return new \WP_Error( 'co_menu', 'Los elementos se han guardado, pero no el nombre: ' . $r->get_error_message(), [ 'status' => 500 ] );
+        }
+        if ( null !== $ubic_nuevas ) {
+            $locs = (array) get_theme_mod( 'nav_menu_locations', [] );
+            foreach ( $locs as $s => $mid ) if ( (int) $mid === $menu_id && ! in_array( $s, $ubic_nuevas, true ) ) $locs[ $s ] = 0;
+            foreach ( $ubic_nuevas as $s ) $locs[ $s ] = $menu_id;
+            set_theme_mod( 'nav_menu_locations', $locs );
+        }
+
+        // Aviso a plugins de caché y traducción, como hace el editor de menús.
+        do_action( 'wp_update_nav_menu', $menu_id, [] );
+
+        // 5. Los ajustes extra, como estaban: si algún gancho los ha cambiado o borrado, se reponen.
+        $restaurados = [];
+        $conservados = 0;
+        foreach ( $metas_antes as $id => $metas ) {
+            if ( in_array( $id, $quitados, true ) ) continue;
+            $extra = array_diff_key( $metas, array_flip( self::MENU_META_WP ) );
+            if ( ! $extra ) continue;
+            $ahora = self::claude_menu_metas( $id );
+            foreach ( $extra as $clave => $vals ) {
+                if ( isset( $ahora[ $clave ] ) && serialize( $ahora[ $clave ] ) === serialize( $vals ) ) { $conservados++; continue; }
+                delete_post_meta( $id, $clave );
+                foreach ( $vals as $val ) add_post_meta( $id, $clave, wp_slash( $val ) );
+                $restaurados[] = $id . ':' . $clave;
+            }
+        }
+
+        $resumen = [];
+        if ( $nuevos ) $resumen[] = count( $nuevos ) . ' añadidos';
+        if ( $quitados ) $resumen[] = count( $quitados ) . ' quitados';
+        if ( null !== $nombre_nuevo ) $resumen[] = 'renombrado';
+        if ( null !== $ubic_nuevas ) $resumen[] = 'ubicaciones: ' . ( $ubic_nuevas ? implode( ', ', $ubic_nuevas ) : 'ninguna' );
+        $this->claude_registrar( 'menu', 0, $menu->name . ' (' . $menu_id . '): ' . count( $ops ) . ' operaciones' . ( $resumen ? ', ' . implode( ', ', $resumen ) : '' ) . ( $restaurados ? ', ' . count( $restaurados ) . ' ajustes extra repuestos' : '' ) );
+
+        $nuevos_ids = [];
+        foreach ( $nuevos as $k => $nv ) $nuevos_ids[ $nv['ref'] ] = $ids[ $k ];
+        $menu = wp_get_nav_menu_object( $menu_id );
+        return $this->claude_menu_leer( $menu ) + [
+            'nuevos'        => (object) $nuevos_ids,
+            'quitados'      => $quitados,
+            'ajustes_extra' => [ 'conservados' => $conservados, 'repuestos' => $restaurados ],
+        ];
+    }
+
+    /** GET /menus/papelera: los últimos elementos quitados, con su índice para restaurarlos. */
+    public function claude_menus_papelera( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_menus();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $out = [];
+        foreach ( (array) get_option( self::MENUS_PAPELERA, [] ) as $i => $e ) {
+            $el = (array) ( $e['elemento'] ?? [] );
+            $out[] = [
+                'indice'        => $i,
+                'fecha'         => $e['fecha'] ?? '',
+                'menu'          => (int) ( $e['menu'] ?? 0 ),
+                'menu_nombre'   => (string) ( $e['menu_nombre'] ?? '' ),
+                'id'            => (int) ( $e['id'] ?? 0 ),
+                'titulo'        => (string) ( $el['titulo'] ?? '' ),
+                'tipo'          => (string) ( $el['tipo'] ?? '' ),
+                'url'           => (string) ( $el['url'] ?? '' ),
+                'ajustes_extra' => $el['ajustes_extra'] ?? new \stdClass(),
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * POST /menus/papelera/<i> {menu?, padre?}: devuelve un elemento a su
+     * menú (u otro), al final, con todos sus ajustes. Si WordPress ya lo ha
+     * vaciado de su papelera, lo rehace desde la copia.
+     */
+    public function claude_menu_restaurar( \WP_REST_Request $request ) {
+        global $wpdb;
+        $ok = $this->claude_puede_menus();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $papelera = (array) get_option( self::MENUS_PAPELERA, [] );
+        $i = (int) $request->get_param( 'i' );
+        if ( ! isset( $papelera[ $i ] ) ) return new \WP_Error( 'co_menu', 'No hay nada con el índice ' . $i . ' en la papelera de menús.', [ 'status' => 404 ] );
+        $e = $papelera[ $i ];
+        $menu = $this->claude_menu_objeto( $request->get_param( 'menu' ) ?: ( $e['menu'] ?? 0 ) );
+        if ( is_wp_error( $menu ) ) return new \WP_Error( 'co_menu', 'El menú de este elemento ya no existe: indica otro con «menu».', [ 'status' => 404 ] );
+        $menu_id = (int) $menu->term_id;
+        $items = $this->claude_menu_items( $menu_id );
+        $pa = null !== $request->get_param( 'padre' ) ? (int) $request->get_param( 'padre' ) : (int) ( $e['padre'] ?? 0 );
+        if ( $pa && ! isset( $items[ $pa ] ) ) $pa = 0;
+        $orden = 1;
+        foreach ( $items as $it ) $orden = max( $orden, (int) $it->menu_order + 1 );
+        $metas = (array) ( $e['metas'] ?? [] );
+        $uno = function ( $k ) use ( $metas ) { return $metas[ $k ][0] ?? ''; };
+
+        $id = (int) ( $e['id'] ?? 0 );
+        $post = $id ? get_post( $id ) : null;
+        if ( $post && 'nav_menu_item' === $post->post_type ) {
+            $wpdb->update( $wpdb->posts, [ 'post_status' => 'publish', 'menu_order' => $orden ], [ 'ID' => $id ] );
+            delete_post_meta( $id, '_wp_trash_meta_status' );
+            delete_post_meta( $id, '_wp_trash_meta_time' );
+            wp_set_object_terms( $id, [ $menu_id ], 'nav_menu' );
+            update_post_meta( $id, '_menu_item_menu_item_parent', (string) $pa );
+            $como = 'recuperado de la papelera de WordPress';
+        } else {
+            $p = (array) ( $e['post'] ?? [] );
+            $id = wp_update_nav_menu_item( $menu_id, 0, [
+                'menu-item-type'        => $uno( '_menu_item_type' ),
+                'menu-item-object'      => $uno( '_menu_item_object' ),
+                'menu-item-object-id'   => (int) $uno( '_menu_item_object_id' ),
+                'menu-item-title'       => $p['post_title'] ?? '',
+                'menu-item-url'         => $uno( '_menu_item_url' ),
+                'menu-item-target'      => $uno( '_menu_item_target' ),
+                'menu-item-classes'     => implode( ' ', (array) $uno( '_menu_item_classes' ) ),
+                'menu-item-xfn'         => $uno( '_menu_item_xfn' ),
+                'menu-item-attr-title'  => $p['post_excerpt'] ?? '',
+                'menu-item-description' => $p['post_content'] ?? '',
+                'menu-item-parent-id'   => $pa,
+                'menu-item-position'    => $orden,
+                'menu-item-status'      => 'publish',
+            ] );
+            if ( is_wp_error( $id ) || ! $id ) return new \WP_Error( 'co_menu', 'No se ha podido rehacer el elemento.', [ 'status' => 500 ] );
+            $id = (int) $id;
+            $como = 'rehecho desde la copia (WordPress ya lo había vaciado de su papelera)';
+        }
+        // Los ajustes extra, tal cual estaban.
+        foreach ( array_diff_key( $metas, array_flip( self::MENU_META_WP ) ) as $clave => $vals ) {
+            delete_post_meta( $id, $clave );
+            foreach ( (array) $vals as $val ) add_post_meta( $id, $clave, wp_slash( $val ) );
+        }
+        clean_post_cache( $id );
+        array_splice( $papelera, $i, 1 );
+        update_option( self::MENUS_PAPELERA, $papelera, false );
+        do_action( 'wp_update_nav_menu', $menu_id, [] );
+        $this->claude_registrar( 'menu_restaurar', 0, ( $e['elemento']['titulo'] ?? '' ) . ' → ' . $menu->name . ' (' . $como . ')' );
+        return [ 'restaurado' => $id, 'como' => $como ] + $this->claude_menu_leer( $menu );
     }
 
     // ── Piezas internas ───────────────────────────────────────
