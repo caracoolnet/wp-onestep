@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.5
+ * Version:     1.5.6
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.5' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.6' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1893,6 +1893,21 @@ class Caracool_OneStep {
             [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_ajustes' ], 'permission_callback' => $perm ],
             [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_ajustes_guardar' ], 'permission_callback' => $perm ],
         ] );
+        // 1.5.6: formularios de Contact Form 7.
+        register_rest_route( $ns, '/formularios', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_formularios' ], 'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_formulario_crear' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/formularios/(?P<id>\d+)', [
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_formulario_cambiar' ], 'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::DELETABLE, 'callback' => [ $this, 'claude_formulario_quitar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/formularios/papelera', [
+            [ 'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_formularios_papelera' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/formularios/papelera/(?P<i>\d+)', [
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_formulario_restaurar' ], 'permission_callback' => $perm ],
+        ] );
     }
 
     /**
@@ -3683,6 +3698,471 @@ class Caracool_OneStep {
         }
         $this->claude_registrar( 'ajustes', 0, implode( ', ', array_keys( $cambios ) ) );
         return $respuesta + [ 'guardado' => true, 'version' => self::claude_ajustes_huella( self::claude_ajustes_todos() ) ];
+    }
+
+    // ── Formularios de Contact Form 7 (1.5.6) ─────────────────
+    // Se trabaja con las funciones del propio CF7 (wpcf7_save_contact_form,
+    // copy, el validador de configuración), así que sus ganchos y su
+    // limpieza se ejecutan igual que desde su pantalla. Lo que CF7 no hace
+    // y aquí sí: «version» para no pisar a nadie, cambios por partes (en el
+    // correo y los mensajes solo cambian las claves que se mandan), parar si
+    // cambia a quién llegan los mensajes sin «confirmar», decir en qué
+    // páginas está puesto cada formulario y, al quitar uno, papelera de
+    // WordPress más una copia completa en la papelera de OneStep (su API
+    // REST lo borra para siempre).
+
+    const FORMULARIOS_PAPELERA = 'caracool_onestep_formularios_papelera';
+
+    /** Las partes de un formulario que se pueden cambiar (las de CF7). */
+    const FORMULARIO_PARTES = [ 'form', 'mail', 'mail_2', 'messages', 'additional_settings' ];
+
+    private function claude_puede_formularios( $cap = 'wpcf7_edit_contact_forms', $id = null ) {
+        if ( ! class_exists( '\WPCF7_ContactForm' ) || ! function_exists( 'wpcf7_save_contact_form' ) ) {
+            return new \WP_Error( 'co_sin_cf7', 'Contact Form 7 no está instalado o no está activo en esta web.', [ 'status' => 503 ] );
+        }
+        $ok = null === $id ? current_user_can( $cap ) : current_user_can( $cap, $id );
+        if ( ! $ok ) {
+            return new \WP_Error( 'co_sin_formularios', 'Este usuario no puede editar los formularios de Contact Form 7.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    private function claude_formulario_objeto( $id ) {
+        $cf = \WPCF7_ContactForm::get_instance( (int) $id );
+        if ( ! $cf || ! $cf->id() ) return new \WP_Error( 'co_formulario', 'No hay ningún formulario de Contact Form 7 con el id ' . (int) $id . '.', [ 'status' => 404 ] );
+        return $cf;
+    }
+
+    private static function claude_formulario_huella( $cf ) {
+        return substr( md5( (string) wp_json_encode( [ $cf->title(), $cf->locale(), $cf->get_properties() ] ) ), 0, 12 );
+    }
+
+    private static function claude_formulario_hash( $cf ) {
+        return (string) get_post_meta( $cf->id(), '_hash', true );
+    }
+
+    /**
+     * A quién llegan los mensajes: destinatario, Cc, Bcc y Responder a de
+     * los dos correos, y si el segundo está activo.
+     */
+    private static function claude_formulario_destinos( $props ) {
+        $out = [];
+        foreach ( [ 'mail', 'mail_2' ] as $m ) {
+            $c = (array) ( $props[ $m ] ?? [] );
+            $activo = 'mail' === $m ? true : ! empty( $c['active'] );
+            $cab = [];
+            foreach ( preg_split( '/\r\n|\n/', (string) ( $c['additional_headers'] ?? '' ) ) as $l ) {
+                if ( preg_match( '/^\s*(cc|bcc|reply-to)\s*:\s*(.+)$/i', $l, $mm ) ) $cab[] = strtolower( $mm[1] ) . ': ' . trim( $mm[2] );
+            }
+            $out[ $m ] = [ 'activo' => $activo, 'destinatario' => trim( (string) ( $c['recipient'] ?? '' ) ), 'cabeceras' => $cab ];
+        }
+        return $out;
+    }
+
+    private static function claude_formulario_errores( $cf, $guardar = false ) {
+        if ( ! class_exists( '\WPCF7_ConfigValidator' ) ) return [];
+        if ( function_exists( 'wpcf7_validate_configuration' ) && ! wpcf7_validate_configuration() ) return [];
+        $v = new \WPCF7_ConfigValidator( $cf );
+        $v->validate();
+        if ( $guardar && $cf->id() ) $v->save();
+        $out = [];
+        foreach ( (array) $v->collect_error_messages( [ 'decodes_html_entities' => true ] ) as $seccion => $errs ) {
+            foreach ( (array) $errs as $e ) $out[] = [ 'parte' => (string) $seccion, 'mensaje' => wp_strip_all_tags( (string) ( $e['message'] ?? '' ) ) ];
+        }
+        return $out;
+    }
+
+    private static function claude_formulario_etiquetas( $cf ) {
+        $out = [];
+        foreach ( (array) $cf->scan_form_tags() as $t ) {
+            if ( '' === (string) $t->name && in_array( $t->basetype, [ 'submit', 'response' ], true ) ) {
+                $out[] = [ 'tipo' => (string) $t->type ];
+                continue;
+            }
+            $out[] = [ 'tipo' => (string) $t->type, 'nombre' => (string) $t->name, 'obligatorio' => '*' === substr( (string) $t->type, -1 ) ];
+        }
+        return $out;
+    }
+
+    /**
+     * Dónde está puesto cada formulario: el shortcode (por id, por hash o por
+     * título) en el contenido, en los datos de Elementor y en los widgets
+     * clásicos. Devuelve id de formulario => lista de usos.
+     */
+    private function claude_formularios_usos( $forms ) {
+        global $wpdb;
+        $usos = [];
+        foreach ( $forms as $cf ) $usos[ $cf->id() ] = [];
+        if ( ! $forms ) return $usos;
+        $filas = $wpdb->get_results(
+            "SELECT p.ID, p.post_type, p.post_status, p.post_title, p.post_content, m.meta_value AS elementor
+             FROM {$wpdb->posts} p
+             LEFT JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = '_elementor_data'
+             WHERE p.post_type NOT IN ('revision','nav_menu_item','wpcf7_contact_form')
+               AND p.post_status IN ('publish','draft','pending','private','future')
+               AND ( p.post_content LIKE '%contact-form%' OR m.meta_value LIKE '%contact-form%' OR m.meta_value LIKE '%cf7%' )"
+        );
+        $textos = [];
+        foreach ( (array) $filas as $f ) {
+            $textos[] = [
+                'donde' => [ 'id' => (int) $f->ID, 'tipo' => (string) $f->post_type, 'estado' => (string) $f->post_status, 'titulo' => (string) $f->post_title ],
+                'texto' => (string) $f->post_content . "\n" . str_replace( '\\"', '"', (string) $f->elementor ),
+                'elementor' => (string) $f->elementor,
+            ];
+        }
+        foreach ( (array) $wpdb->get_results( "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE 'widget\\_%' AND option_value LIKE '%contact-form%'" ) as $o ) {
+            $textos[] = [ 'donde' => [ 'widget' => (string) $o->option_name ], 'texto' => (string) $o->option_value, 'elementor' => '' ];
+        }
+        foreach ( $forms as $cf ) {
+            $id = (int) $cf->id();
+            $hash = self::claude_formulario_hash( $cf );
+            $claves = [ preg_quote( (string) $id, '/' ) ];
+            if ( strlen( $hash ) >= 7 ) $claves[] = preg_quote( substr( $hash, 0, 7 ), '/' ) . '[0-9a-f]*';
+            $por_id = '/\[contact-form(?:-7)?\s[^\]]*\bid\s*=\s*["\']?(?:' . implode( '|', $claves ) . ')(?:["\'\s\]])/i';
+            $por_titulo = '/\[contact-form(?:-7)?\s[^\]]*\btitle\s*=\s*["\']' . preg_quote( $cf->title(), '/' ) . '["\']/i';
+            foreach ( $textos as $t ) {
+                $como = null;
+                if ( preg_match( $por_id, $t['texto'] ) ) $como = 'shortcode';
+                elseif ( preg_match( $por_titulo, $t['texto'] ) && ! preg_match( '/\bid\s*=/', $t['texto'] ) ) $como = 'shortcode por título';
+                // Widgets de terceros para CF7 dentro de Elementor (guardan el id en un ajuste con «form» o «cf7» en el nombre).
+                elseif ( '' !== $t['elementor'] && preg_match( '/"[a-z0-9_]*(?:cf7|contact_form)[a-z0-9_]*"\s*:\s*"?' . $id . '"?[,}]/i', $t['elementor'] ) ) $como = 'widget de Elementor';
+                if ( $como ) $usos[ $id ][] = $t['donde'] + [ 'como' => $como ];
+            }
+        }
+        return $usos;
+    }
+
+    /** Un formulario completo, tal como lo guarda CF7, más lo que ayuda a editarlo. */
+    private function claude_formulario_leer( $cf, $usos = null ) {
+        $props = $cf->get_properties();
+        $partes = array_intersect_key( $props, array_flip( self::FORMULARIO_PARTES ) );
+        $extra = array_diff_key( $props, $partes );
+        if ( null === $usos ) $usos = $this->claude_formularios_usos( [ $cf ] )[ $cf->id() ];
+        $hash = self::claude_formulario_hash( $cf );
+        return [
+            'id'          => (int) $cf->id(),
+            'titulo'      => (string) $cf->title(),
+            'idioma'      => (string) $cf->locale(),
+            'hash'        => $hash ? substr( $hash, 0, 7 ) : null,
+            'shortcode'   => (string) $cf->shortcode(),
+            'version'     => self::claude_formulario_huella( $cf ),
+            'propiedades' => $partes,
+            // Propiedades que añaden otros plugins: se conservan, pero aquí no se cambian.
+            'propiedades_de_otros_plugins' => array_keys( $extra ),
+            'campos'      => self::claude_formulario_etiquetas( $cf ),
+            'destinos'    => self::claude_formulario_destinos( $props ),
+            'errores_config' => self::claude_formulario_errores( $cf ),
+            'usos'        => $usos,
+        ];
+    }
+
+    /** GET /formularios[?id=]: la lista de formularios (o uno entero), dónde están puestos y la papelera. */
+    public function claude_formularios( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_formularios();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $solo = (int) $request->get_param( 'id' );
+        if ( $solo ) {
+            $cf = $this->claude_formulario_objeto( $solo );
+            if ( is_wp_error( $cf ) ) return $cf;
+            return $this->claude_formulario_leer( $cf );
+        }
+        $forms = (array) \WPCF7_ContactForm::find( [ 'posts_per_page' => -1, 'orderby' => 'title', 'order' => 'ASC' ] );
+        $usos = $this->claude_formularios_usos( $forms );
+        $lista = [];
+        foreach ( $forms as $cf ) {
+            $hash = self::claude_formulario_hash( $cf );
+            $lista[] = [
+                'id'        => (int) $cf->id(),
+                'titulo'    => (string) $cf->title(),
+                'idioma'    => (string) $cf->locale(),
+                'hash'      => $hash ? substr( $hash, 0, 7 ) : null,
+                'shortcode' => (string) $cf->shortcode(),
+                'campos'    => count( array_filter( self::claude_formulario_etiquetas( $cf ), function ( $t ) { return isset( $t['nombre'] ); } ) ),
+                'destinatario' => trim( (string) ( $cf->prop( 'mail' )['recipient'] ?? '' ) ),
+                'usos'      => $usos[ $cf->id() ],
+            ];
+        }
+        return [
+            'cf7'         => defined( 'WPCF7_VERSION' ) ? WPCF7_VERSION : null,
+            'formularios' => $lista,
+            'en_papelera' => count( (array) get_option( self::FORMULARIOS_PAPELERA, [] ) ),
+        ];
+    }
+
+    /**
+     * Prepara los datos para wpcf7_save_contact_form a partir de lo pedido y
+     * de las propiedades que ya tiene el formulario: en mail, mail_2 y
+     * messages se mezclan las claves pedidas con las de ahora.
+     */
+    private static function claude_formulario_datos( $p, $actuales ) {
+        $datos = [];
+        $tocadas = [];
+        if ( array_key_exists( 'titulo', $p ) ) {
+            $t = trim( (string) $p['titulo'] );
+            if ( '' === $t ) return new \WP_Error( 'co_formulario', 'El «titulo» no puede quedar vacío.', [ 'status' => 400 ] );
+            $datos['title'] = $t;
+            $tocadas[] = 'titulo';
+        }
+        if ( array_key_exists( 'idioma', $p ) ) {
+            $l = (string) $p['idioma'];
+            if ( function_exists( 'wpcf7_is_valid_locale' ) && ! wpcf7_is_valid_locale( $l ) ) return new \WP_Error( 'co_formulario', '«' . $l . '» no es un idioma válido (por ejemplo es_ES).', [ 'status' => 400 ] );
+            $datos['locale'] = $l;
+            $tocadas[] = 'idioma';
+        }
+        $props = (array) ( $p['propiedades'] ?? [] );
+        foreach ( $props as $k => $v ) {
+            if ( ! in_array( $k, self::FORMULARIO_PARTES, true ) ) {
+                return new \WP_Error( 'co_formulario', '«' . $k . '» no es una parte que se pueda cambiar. Partes: ' . implode( ', ', self::FORMULARIO_PARTES ) . '.', [ 'status' => 400 ] );
+            }
+            if ( in_array( $k, [ 'form', 'additional_settings' ], true ) ) {
+                if ( ! is_string( $v ) ) return new \WP_Error( 'co_formulario', '«' . $k . '» va como texto.', [ 'status' => 400 ] );
+                $datos[ $k ] = $v;
+            } else {
+                if ( ! is_array( $v ) ) return new \WP_Error( 'co_formulario', '«' . $k . '» va como objeto {clave: valor}; solo cambian las claves que se manden.', [ 'status' => 400 ] );
+                if ( 'messages' !== $k ) {
+                    $validas = [ 'active', 'subject', 'sender', 'recipient', 'body', 'additional_headers', 'attachments', 'use_html', 'exclude_blank' ];
+                    $malas = array_diff( array_keys( $v ), $validas );
+                    if ( $malas ) return new \WP_Error( 'co_formulario', 'En «' . $k . '» no existe ' . implode( ', ', $malas ) . '. Claves: ' . implode( ', ', $validas ) . '.', [ 'status' => 400 ] );
+                } elseif ( function_exists( 'wpcf7_messages' ) ) {
+                    $malas = array_diff( array_keys( $v ), array_keys( (array) wpcf7_messages() ) );
+                    if ( $malas ) return new \WP_Error( 'co_formulario', 'En «messages» no existe ' . implode( ', ', $malas ) . '. Las claves son las de GET /formularios?id=.', [ 'status' => 400 ] );
+                }
+                $datos[ $k ] = array_merge( (array) ( $actuales[ $k ] ?? [] ), $v );
+            }
+            $tocadas[] = $k;
+        }
+        if ( ! $tocadas ) return new \WP_Error( 'co_formulario', 'No se ha pedido ningún cambio: «titulo», «idioma» o «propiedades».', [ 'status' => 400 ] );
+        return [ $datos, $tocadas ];
+    }
+
+    /** Qué partes han cambiado de verdad entre dos lecturas. */
+    private static function claude_formulario_diferencias( $antes, $despues ) {
+        $out = [];
+        if ( $antes['titulo'] !== $despues['titulo'] ) $out[] = 'titulo';
+        if ( $antes['idioma'] !== $despues['idioma'] ) $out[] = 'idioma';
+        foreach ( self::FORMULARIO_PARTES as $k ) {
+            if ( wp_json_encode( $antes['props'][ $k ] ?? null ) !== wp_json_encode( $despues['props'][ $k ] ?? null ) ) $out[] = $k;
+        }
+        return $out;
+    }
+
+    private static function claude_formulario_foto( $cf ) {
+        return [ 'titulo' => (string) $cf->title(), 'idioma' => (string) $cf->locale(), 'props' => $cf->get_properties() ];
+    }
+
+    /**
+     * Lo que pide «confirmar»: que cambie a quién llegan los mensajes o los
+     * ajustes adicionales (pueden apagar el envío, por ejemplo skip_mail).
+     */
+    private static function claude_formulario_delicados( $antes_props, $despues_props, $cambios ) {
+        $out = [];
+        if ( wp_json_encode( self::claude_formulario_destinos( $antes_props ) ) !== wp_json_encode( self::claude_formulario_destinos( $despues_props ) ) ) {
+            $out[] = 'cambia a quién llegan los mensajes del formulario (destinatario, Cc, Bcc, Responder a o el segundo correo)';
+        }
+        if ( in_array( 'additional_settings', $cambios, true ) ) {
+            $out[] = 'cambian los ajustes adicionales (pueden apagar el envío del correo o cambiar cómo se comporta el formulario)';
+        }
+        return $out;
+    }
+
+    /**
+     * POST /formularios {titulo, propiedades?, idioma?, duplicar_de?, probar?, confirmar?}:
+     * crea un formulario desde la plantilla de CF7 (o como copia de otro) y le aplica lo pedido.
+     */
+    public function claude_formulario_crear( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_formularios();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $p = (array) $request->get_json_params();
+        if ( '' === trim( (string) ( $p['titulo'] ?? '' ) ) ) return new \WP_Error( 'co_formulario', 'El formulario nuevo necesita un «titulo».', [ 'status' => 400 ] );
+        $origen = null;
+        if ( ! empty( $p['duplicar_de'] ) ) {
+            $origen = $this->claude_formulario_objeto( $p['duplicar_de'] );
+            if ( is_wp_error( $origen ) ) return $origen;
+            $base = self::claude_formulario_foto( $origen );
+        } else {
+            $base = self::claude_formulario_foto( \WPCF7_ContactForm::get_template( isset( $p['idioma'] ) ? [ 'locale' => (string) $p['idioma'] ] : '' ) );
+        }
+        $d = self::claude_formulario_datos( $p, $base['props'] );
+        if ( is_wp_error( $d ) ) return $d;
+        list( $datos ) = $d;
+        // Una copia lleva todas las partes del original (y su idioma) salvo lo que se cambie.
+        if ( $origen ) {
+            foreach ( self::FORMULARIO_PARTES as $k ) if ( ! isset( $datos[ $k ] ) && isset( $base['props'][ $k ] ) ) $datos[ $k ] = $base['props'][ $k ];
+            if ( ! isset( $datos['locale'] ) && '' !== $base['idioma'] ) $datos['locale'] = $base['idioma'];
+        }
+        $datos = [ 'id' => -1 ] + $datos;
+
+        // Primero sin guardar, para ver cómo queda.
+        $prueba = wpcf7_save_contact_form( $datos, 'claude_probar' );
+        if ( ! $prueba ) return new \WP_Error( 'co_formulario', 'Contact Form 7 no ha podido preparar el formulario.', [ 'status' => 500 ] );
+        $despues = self::claude_formulario_foto( $prueba );
+        $tocadas = array_values( array_intersect( self::FORMULARIO_PARTES, array_keys( (array) ( $p['propiedades'] ?? [] ) ) ) );
+        $delicados = self::claude_formulario_delicados( $base['props'], $despues['props'], $tocadas );
+        $respuesta = [
+            'base'           => $origen ? 'copia del formulario ' . (int) $origen->id() : 'plantilla de Contact Form 7',
+            'destinos'       => self::claude_formulario_destinos( $despues['props'] ),
+            'errores_config' => self::claude_formulario_errores( $prueba ),
+            'avisos'         => $delicados,
+        ];
+        if ( ! empty( $p['probar'] ) ) return $respuesta + [ 'creado' => false, 'propiedades' => array_intersect_key( $despues['props'], array_flip( self::FORMULARIO_PARTES ) ) ];
+        if ( $delicados && empty( $p['confirmar'] ) ) {
+            return new \WP_Error( 'co_formulario_confirmar', 'Este formulario necesita «confirmar»: ' . implode( '; ', $delicados ) . '. Enséñale a la persona los destinos (con «probar» salen sin crear nada) y repite con confirmar=true solo con su visto bueno.', [ 'status' => 412 ] );
+        }
+        $nuevo = wpcf7_save_contact_form( $datos, 'save' );
+        $id = $nuevo ? (int) $nuevo->id() : 0;
+        if ( ! $id ) return new \WP_Error( 'co_formulario', 'Contact Form 7 no ha podido guardar el formulario.', [ 'status' => 500 ] );
+        $cf = $this->claude_formulario_objeto( $id );
+        if ( is_wp_error( $cf ) ) return $cf;
+        self::claude_formulario_errores( $cf, true );
+        $this->claude_registrar( 'formulario_crear', $id, $cf->title() . ( $origen ? ' (copia de ' . (int) $origen->id() . ')' : '' ) );
+        return [ 'creado' => $id, 'avisos' => $delicados ] + $this->claude_formulario_leer( $cf, [] );
+    }
+
+    /**
+     * POST /formularios/<id> {version, titulo?, idioma?, propiedades?, probar?, confirmar?}:
+     * cambia solo lo pedido, con la función de guardar de CF7.
+     */
+    public function claude_formulario_cambiar( \WP_REST_Request $request ) {
+        $id = (int) $request->get_param( 'id' );
+        $ok = $this->claude_puede_formularios( 'wpcf7_edit_contact_form', $id );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $cf = $this->claude_formulario_objeto( $id );
+        if ( is_wp_error( $cf ) ) return $cf;
+        $p = (array) $request->get_json_params();
+        $v = (string) ( $p['version'] ?? '' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» del formulario (la da GET /formularios?id=).', [ 'status' => 428 ] );
+        if ( $v !== self::claude_formulario_huella( $cf ) ) return new \WP_Error( 'co_cambiada', 'El formulario ha cambiado desde que se leyó: vuelve a leerlo.', [ 'status' => 409 ] );
+        $antes = self::claude_formulario_foto( $cf );
+        $d = self::claude_formulario_datos( $p, $antes['props'] );
+        if ( is_wp_error( $d ) ) return $d;
+        list( $datos ) = $d;
+
+        // Primero sin guardar, para ver qué cambia de verdad.
+        $prueba = wpcf7_save_contact_form( [ 'id' => $id ] + $datos, 'claude_probar' );
+        if ( ! $prueba ) return new \WP_Error( 'co_formulario', 'Contact Form 7 no ha podido preparar el cambio.', [ 'status' => 500 ] );
+        $despues = self::claude_formulario_foto( $prueba );
+        $cambios = self::claude_formulario_diferencias( $antes, $despues );
+        $delicados = self::claude_formulario_delicados( $antes['props'], $despues['props'], $cambios );
+        $respuesta = [
+            'cambios'        => $cambios,
+            'destinos'       => [ 'antes' => self::claude_formulario_destinos( $antes['props'] ), 'despues' => self::claude_formulario_destinos( $despues['props'] ) ],
+            'errores_config' => self::claude_formulario_errores( $prueba ),
+            'avisos'         => $delicados,
+        ];
+        if ( ! empty( $p['probar'] ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => self::claude_formulario_huella( $cf ) ];
+        }
+        if ( $delicados && empty( $p['confirmar'] ) ) {
+            return new \WP_Error( 'co_formulario_confirmar', 'Este cambio necesita «confirmar»: ' . implode( '; ', $delicados ) . '. Enséñale a la persona el antes y el después (con «probar» salen sin guardar) y repite con confirmar=true solo con su visto bueno.', [ 'status' => 412 ] );
+        }
+        $guardado = wpcf7_save_contact_form( [ 'id' => $id ] + $datos, 'save' );
+        if ( ! $guardado ) return new \WP_Error( 'co_formulario', 'Contact Form 7 no ha podido guardar el formulario.', [ 'status' => 500 ] );
+        $cf = $this->claude_formulario_objeto( $id );
+        if ( is_wp_error( $cf ) ) return $cf;
+        self::claude_formulario_errores( $cf, true );
+        $this->claude_registrar( 'formulario', $id, implode( ', ', $cambios ) );
+        return [ 'guardado' => true ] + $respuesta + [ 'version' => self::claude_formulario_huella( $cf ) ];
+    }
+
+    /**
+     * DELETE /formularios/<id> {version, confirmar?}: a la papelera de WordPress
+     * y una copia completa a la papelera de OneStep. Si está puesto en alguna
+     * página, sin «confirmar» se para y dice dónde.
+     */
+    public function claude_formulario_quitar( \WP_REST_Request $request ) {
+        $id = (int) $request->get_param( 'id' );
+        $ok = $this->claude_puede_formularios( 'wpcf7_delete_contact_form', $id );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $cf = $this->claude_formulario_objeto( $id );
+        if ( is_wp_error( $cf ) ) return $cf;
+        $v = (string) $request->get_param( 'version' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» del formulario (la da GET /formularios?id=).', [ 'status' => 428 ] );
+        if ( $v !== self::claude_formulario_huella( $cf ) ) return new \WP_Error( 'co_cambiada', 'El formulario ha cambiado desde que se leyó: vuelve a leerlo.', [ 'status' => 409 ] );
+        $usos = $this->claude_formularios_usos( [ $cf ] )[ $id ];
+        $c = $request->get_param( 'confirmar' );
+        $confirmar = ! empty( $c ) && 'false' !== $c;
+        if ( $usos && ! $confirmar ) {
+            $donde = array_map( function ( $u ) { return isset( $u['titulo'] ) ? '«' . $u['titulo'] . '» (' . $u['id'] . ')' : $u['widget']; }, $usos );
+            return new \WP_Error( 'co_formulario_en_uso', 'El formulario está puesto en ' . implode( ', ', $donde ) . ': al quitarlo, ahí deja de salir. Repite con confirmar=true solo con el visto bueno de la persona.', [ 'status' => 412 ] );
+        }
+        $post = get_post( $id );
+        $metas = [];
+        foreach ( (array) get_post_custom( $id ) as $k => $vals ) $metas[ $k ] = array_map( 'maybe_unserialize', array_values( (array) $vals ) );
+        $papelera = (array) get_option( self::FORMULARIOS_PAPELERA, [] );
+        array_unshift( $papelera, [
+            'fecha'  => current_time( 'mysql' ),
+            'id'     => $id,
+            'titulo' => (string) $cf->title(),
+            'hash'   => substr( self::claude_formulario_hash( $cf ), 0, 7 ),
+            'usos'   => $usos,
+            'post'   => [ 'post_title' => $post->post_title, 'post_name' => (string) ( $post->post_name ?? '' ), 'post_content' => (string) ( $post->post_content ?? '' ), 'post_author' => (int) ( $post->post_author ?? 0 ) ],
+            'metas'  => $metas,
+        ] );
+        update_option( self::FORMULARIOS_PAPELERA, array_slice( $papelera, 0, 50 ), false );
+        if ( ! wp_trash_post( $id ) ) return new \WP_Error( 'co_formulario', 'WordPress no ha podido mandar el formulario a la papelera (la copia sí está guardada).', [ 'status' => 500 ] );
+        $this->claude_registrar( 'formulario_quitar', 0, $cf->title() . ' (' . $id . ')' );
+        return [ 'quitado' => $id, 'titulo' => (string) $cf->title(), 'usos' => $usos, 'papelera' => 0 ];
+    }
+
+    /** GET /formularios/papelera: los últimos formularios quitados, con su índice para restaurarlos. */
+    public function claude_formularios_papelera( \WP_REST_Request $request ) {
+        $ok = $this->claude_puede_formularios();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $out = [];
+        foreach ( (array) get_option( self::FORMULARIOS_PAPELERA, [] ) as $i => $e ) {
+            $out[] = [ 'indice' => $i, 'fecha' => $e['fecha'] ?? '', 'id' => (int) ( $e['id'] ?? 0 ), 'titulo' => (string) ( $e['titulo'] ?? '' ), 'usos' => $e['usos'] ?? [] ];
+        }
+        return $out;
+    }
+
+    /**
+     * POST /formularios/papelera/<i>: devuelve el formulario tal cual estaba.
+     * Si WordPress ya lo ha vaciado de su papelera, lo rehace desde la copia
+     * con el mismo hash, así los shortcodes nuevos ([contact-form-7 id="hash"]) siguen valiendo.
+     */
+    public function claude_formulario_restaurar( \WP_REST_Request $request ) {
+        global $wpdb;
+        $ok = $this->claude_puede_formularios();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $papelera = (array) get_option( self::FORMULARIOS_PAPELERA, [] );
+        $i = (int) $request->get_param( 'i' );
+        if ( ! isset( $papelera[ $i ] ) ) return new \WP_Error( 'co_formulario', 'No hay nada con el índice ' . $i . ' en la papelera de formularios.', [ 'status' => 404 ] );
+        $e = $papelera[ $i ];
+        $id = (int) ( $e['id'] ?? 0 );
+        $post = $id ? get_post( $id ) : null;
+        $avisos = [];
+        if ( $post && 'wpcf7_contact_form' === $post->post_type ) {
+            if ( 'trash' === $post->post_status ) wp_untrash_post( $id );
+            // wp_untrash_post lo deja en borrador; CF7 los quiere publicados.
+            $wpdb->update( $wpdb->posts, [ 'post_status' => 'publish' ], [ 'ID' => $id ] );
+            clean_post_cache( $id );
+            $como = 'recuperado de la papelera de WordPress';
+        } else {
+            $p = (array) ( $e['post'] ?? [] );
+            $nuevo = wp_insert_post( wp_slash( [
+                'post_type'    => 'wpcf7_contact_form',
+                'post_status'  => 'publish',
+                'post_title'   => (string) ( $p['post_title'] ?? $e['titulo'] ?? '' ),
+                'post_name'    => (string) ( $p['post_name'] ?? '' ),
+                'post_content' => (string) ( $p['post_content'] ?? '' ),
+                'post_author'  => (int) ( $p['post_author'] ?? 0 ),
+            ] ), true );
+            if ( is_wp_error( $nuevo ) || ! $nuevo ) return new \WP_Error( 'co_formulario', 'No se ha podido rehacer el formulario.', [ 'status' => 500 ] );
+            foreach ( (array) ( $e['metas'] ?? [] ) as $clave => $vals ) {
+                if ( in_array( $clave, [ '_wp_trash_meta_status', '_wp_trash_meta_time', '_edit_lock', '_edit_last' ], true ) ) continue;
+                delete_post_meta( $nuevo, $clave );
+                foreach ( (array) $vals as $val ) add_post_meta( $nuevo, $clave, wp_slash( $val ) );
+            }
+            $id = (int) $nuevo;
+            $como = 'rehecho desde la copia (WordPress ya lo había vaciado de su papelera)';
+            $avisos[] = 'Tiene un id nuevo (' . $id . '). Los shortcodes con el hash siguen valiendo; los que usaban el id antiguo (' . (int) ( $e['id'] ?? 0 ) . ') hay que cambiarlos.';
+        }
+        array_splice( $papelera, $i, 1 );
+        update_option( self::FORMULARIOS_PAPELERA, $papelera, false );
+        $cf = $this->claude_formulario_objeto( $id );
+        if ( is_wp_error( $cf ) ) return $cf;
+        $this->claude_registrar( 'formulario_restaurar', $id, $cf->title() . ' (' . $como . ')' );
+        return [ 'restaurado' => $id, 'como' => $como, 'avisos' => $avisos ] + $this->claude_formulario_leer( $cf );
     }
 
     // ── Piezas internas ───────────────────────────────────────
