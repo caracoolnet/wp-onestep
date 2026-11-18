@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.8
+ * Version:     1.5.9
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.8' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.9' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1240,6 +1240,14 @@ class Caracool_OneStep {
 
         if ( $this->maintenance_user_bypasses( $s ) ) return;
 
+        // 1.5.9: pase de vista previa que pide Claude para comprobar una web en
+        // obras sin sesión. Vale unos minutos y no se guarda en ninguna caché.
+        if ( isset( $_GET['co_vista'] ) && self::vista_previa_valida( wp_unslash( $_GET['co_vista'] ) ) ) {
+            nocache_headers();
+            header( 'X-Robots-Tag: noindex, nofollow' );
+            return;
+        }
+
         $status = (int) $s['maintenance_http_status'];
 
         if ( 301 === $status && ! empty( $s['maintenance_redirect_url'] ) ) {
@@ -1256,6 +1264,13 @@ class Caracool_OneStep {
 
         $this->maintenance_render_page( $s );
         exit;
+    }
+
+    /** ¿Es un pase de vista previa vigente? Se guarda solo su huella, con caducidad. */
+    public static function vista_previa_valida( $pase ) {
+        $pase = is_string( $pase ) ? $pase : '';
+        if ( ! preg_match( '/^[A-Za-z0-9]{32,64}$/', $pase ) ) return false;
+        return (bool) get_transient( 'co_vista_' . substr( hash( 'sha256', $pase ), 0, 40 ) );
     }
 
     private function maintenance_user_bypasses( $s ) {
@@ -1929,6 +1944,26 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/formularios/papelera/(?P<i>\d+)', [
             [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_formulario_restaurar' ], 'permission_callback' => $perm ],
         ] );
+        // 1.5.9: pase para comprobar una web en obras, ajustes de documento,
+        // tipo de una plantilla, opciones de plugins con lista blanca y redirecciones.
+        register_rest_route( $ns, '/vista-previa', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_vista_previa' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/elementor/(?P<id>\d+)/documento', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_documento' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_documento_guardar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/elementor/plantillas/(?P<id>\d+)/tipo', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_plantilla_tipo' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/plugins/opciones', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_opciones_plugin' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_opciones_plugin_guardar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/redirecciones', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_redirecciones' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_redirecciones_guardar' ], 'permission_callback' => $perm ],
+        ] );
     }
 
     /**
@@ -2012,6 +2047,25 @@ class Caracool_OneStep {
             'usuario'       => wp_get_current_user()->user_login,
             // Actualizar plugins, temas y WordPress pide un usuario Administrador.
             'mantenimiento' => $this->claude_puede_mantener( 'update_plugins' ) === true,
+            // 1.5.9: la web está cerrada con el modo mantenimiento de OneStep.
+            'en_obras'      => ! empty( $this->get_settings()['maintenance_enabled'] ),
+        ];
+    }
+
+    /**
+     * POST /vista-previa {minutos?}: un pase para ver la web en obras sin
+     * sesión (?co_vista=<pase>). Caduca solo (10 minutos; máximo 30).
+     */
+    public function claude_vista_previa( \WP_REST_Request $request ) {
+        $min  = max( 1, min( 30, (int) ( $request->get_param( 'minutos' ) ?: 10 ) ) );
+        $pase = wp_generate_password( 40, false, false );
+        set_transient( 'co_vista_' . substr( hash( 'sha256', $pase ), 0, 40 ), get_current_user_id(), $min * MINUTE_IN_SECONDS );
+        return [
+            'pase'      => $pase,
+            'parametro' => 'co_vista',
+            'caduca'    => gmdate( 'c', time() + $min * MINUTE_IN_SECONDS ),
+            'en_obras'  => ! empty( $this->get_settings()['maintenance_enabled'] ),
+            'nota'      => 'Añade ?co_vista=<pase> a cualquier URL de la web: se salta el modo mantenimiento y no se guarda en la caché.',
         ];
     }
 
@@ -2785,6 +2839,16 @@ class Caracool_OneStep {
         return $this->claude_puede_diseno();
     }
 
+    /** 1.5.9: avisos sobre los ajustes de Motion que no bloquean el guardado. */
+    public static function claude_motion_avisos( $todo ) {
+        $avisos = [];
+        $intro  = is_array( $todo['intro'] ?? null ) ? $todo['intro'] : [];
+        if ( 'si' === ( $intro['activo'] ?? '' ) && isset( $intro['dias'] ) && 0 === (int) $intro['dias'] ) {
+            $avisos[] = 'La Intro está encendida con «recordar durante» en 0 días: sale en cada visita y en cada recarga. Antes de lanzar una web, ponlo en 7.';
+        }
+        return $avisos;
+    }
+
     /** GET /motion/ajustes: los ajustes del panel de Caracool → Motion, por módulo, y su «version». */
     public function claude_motion_ajustes() {
         $ok = $this->claude_motion_comprobar();
@@ -2809,6 +2873,7 @@ class Caracool_OneStep {
         return [
             'motion'  => CARACOOL_MOTION_VERSION,
             'version' => self::claude_motion_huella( $todo ),
+            'avisos'  => self::claude_motion_avisos( $todo ),
             'modulos' => $modulos,
             'nota'    => 'Los interruptores valen «si» o «no» (al guardar también true o false). Lo demás, con el valor tal como sale aquí.',
         ];
@@ -2885,13 +2950,15 @@ class Caracool_OneStep {
             $nuevos[ $nombre ] = $norm;
         }
 
-        $respuesta = [ 'cambios' => (object) $cambios ];
+        $respuesta = [ 'cambios' => (object) $cambios, 'avisos' => self::claude_motion_avisos( array_merge( $antes, $nuevos ) ) ];
         if ( ! empty( $p['probar'] ) || ! $cambios ) {
             return $respuesta + [ 'guardado' => false, 'version' => self::claude_motion_huella( $antes ) ];
         }
         foreach ( $nuevos as $nombre => $norm ) {
             update_option( constant( $clases[ $nombre ] . '::OPTION_KEY' ), $norm );
         }
+        // 1.5.9: lo que Elementor tenga ya pintado se rehace con los ajustes nuevos.
+        delete_post_meta_by_key( '_elementor_element_cache' );
         $this->claude_registrar( 'motion', 0, implode( ', ', array_keys( $cambios ) ) );
         $ahora = $this->claude_motion_todo();
         return $respuesta + [ 'guardado' => true, 'version' => is_wp_error( $ahora ) ? '' : self::claude_motion_huella( $ahora ) ];
@@ -3166,6 +3233,90 @@ class Caracool_OneStep {
         return $avisos;
     }
 
+    /**
+     * 1.5.9: todos los tipos de plantilla de la biblioteca que se pueden crear
+     * (también los que no llevan condiciones, como loop-item o section).
+     * tipo => [nombre, condiciones (bool)].
+     */
+    private function claude_plantillas_tipos_todos() {
+        $tipos = [];
+        $docs  = \Elementor\Plugin::$instance->documents;
+        foreach ( (array) ( method_exists( $docs, 'get_document_types' ) ? $docs->get_document_types() : [] ) as $tipo => $clase ) {
+            try {
+                if ( ! is_string( $tipo ) || in_array( $tipo, [ 'kit', 'wp-post', 'wp-page', 'not-supported', 'landing-page', 'cloud-template-preview' ], true ) ) continue;
+                if ( ! in_array( 'elementor_library', (array) $clase::get_property( 'cpt' ), true ) ) continue;
+                if ( false === $clase::get_property( 'show_in_library' ) && ! $clase::get_property( 'support_conditions' ) && 'loop-item' !== $tipo ) continue;
+                $tipos[ $tipo ] = [
+                    'nombre'      => wp_strip_all_tags( (string) call_user_func( [ $clase, 'get_title' ] ) ),
+                    'condiciones' => (bool) $clase::get_property( 'support_conditions' ),
+                ];
+            } catch ( \Throwable $e ) {
+                continue;
+            }
+        }
+        return $tipos;
+    }
+
+    /**
+     * 1.5.9: plantillas de la biblioteca cuyo tipo y término de taxonomía no
+     * casan (las creadas a pelo por la REST de WordPress): el maquetador de
+     * temas las filtra mal o no las ve.
+     */
+    private function claude_plantillas_revisar() {
+        $out = [];
+        $ids = get_posts( [ 'post_type' => 'elementor_library', 'post_status' => [ 'publish', 'draft', 'private', 'pending' ], 'numberposts' => 300, 'fields' => 'ids', 'suppress_filters' => true ] );
+        foreach ( (array) $ids as $id ) {
+            $meta    = (string) get_post_meta( $id, '_elementor_template_type', true );
+            $terms   = wp_get_object_terms( $id, 'elementor_library_type', [ 'fields' => 'slugs' ] );
+            $termino = is_array( $terms ) && $terms ? (string) $terms[0] : '';
+            if ( '' !== $meta && $meta === $termino ) continue;
+            $out[] = [ 'id' => (int) $id, 'titulo' => get_the_title( $id ), 'tipo' => $meta ?: null, 'termino' => $termino ?: null ];
+            if ( count( $out ) >= 50 ) break;
+        }
+        return $out;
+    }
+
+    /**
+     * 1.5.9: qué plantilla gana en cada ubicación para una página (por
+     * defecto, la portada), con el mismo cálculo que Elementor Pro al pintar.
+     */
+    private function claude_plantillas_ganadoras( $g, $pagina ) {
+        global $wp_query, $wp_the_query, $post;
+        $guardados = [ $wp_query, $wp_the_query, $post ];
+        $pagina    = (int) $pagina;
+        if ( ! $pagina && 'page' === get_option( 'show_on_front' ) ) $pagina = (int) get_option( 'page_on_front' );
+        $p = $pagina ? get_post( $pagina ) : null;
+        if ( $pagina && ( ! $p || 'publish' !== $p->post_status ) ) {
+            return [ 'error' => 'No hay ningún contenido publicado con el id ' . $pagina . '.' ];
+        }
+        $out = [ 'pagina' => $pagina ?: null, 'titulo' => $p ? get_the_title( $p ) : 'Portada (entradas)', 'ubicaciones' => [] ];
+        try {
+            $q = $p ? new \WP_Query( 'page' === $p->post_type ? [ 'page_id' => $p->ID ] : [ 'p' => $p->ID, 'post_type' => $p->post_type ] ) : new \WP_Query( [] );
+            $wp_query = $wp_the_query = $q; // phpcs:ignore WordPress.WP.GlobalVariablesOverride
+            if ( $p ) $post = $p; // phpcs:ignore WordPress.WP.GlobalVariablesOverride
+            foreach ( [ 'header', 'footer', 'single', 'archive', 'popup' ] as $loc ) {
+                if ( ! method_exists( $g, 'get_location_templates' ) ) break;
+                $prio = (array) $g->get_location_templates( $loc );
+                if ( ! $prio ) continue;
+                $filas = [];
+                foreach ( $prio as $tid => $pr ) $filas[] = [ 'id' => (int) $tid, 'titulo' => get_the_title( $tid ), 'prioridad' => (int) $pr ];
+                $fila = [ 'gana' => 'popup' === $loc ? $filas : $filas[0] ];
+                if ( 'popup' !== $loc && count( $filas ) > 1 ) {
+                    $fila['otras'] = array_slice( $filas, 1 );
+                    if ( $filas[1]['prioridad'] === $filas[0]['prioridad'] ) {
+                        $fila['empate'] = 'Hay más de una plantilla con la misma prioridad: Elementor enseña la primera que encuentra. Conviene que solo una tenga esa condición.';
+                    }
+                }
+                $out['ubicaciones'][ $loc ] = $fila;
+            }
+        } catch ( \Throwable $e ) {
+            $out['error'] = 'No se ha podido calcular: ' . $e->getMessage();
+        } finally {
+            list( $wp_query, $wp_the_query, $post ) = $guardados; // phpcs:ignore WordPress.WP.GlobalVariablesOverride
+        }
+        return $out;
+    }
+
     /** GET /elementor/plantillas: las plantillas con condiciones y los tipos que admite la web. */
     public function claude_plantillas( $request = null ) {
         $g = $this->claude_plantillas_gestor();
@@ -3173,11 +3324,52 @@ class Caracool_OneStep {
         $tipos = $this->claude_plantillas_tipos();
         $lista = [];
         foreach ( $this->claude_plantillas_ids( $tipos ) as $id ) $lista[] = $this->claude_plantilla_ficha( $id );
+        $todos = $this->claude_plantillas_tipos_todos();
+        $sin   = [];
+        foreach ( $todos as $t => $info ) if ( ! isset( $tipos[ $t ] ) ) $sin[ $t ] = $info['nombre'];
+        $pagina = $request instanceof \WP_REST_Request ? (int) $request->get_param( 'pagina' ) : 0;
         return [
-            'plantillas' => $lista,
-            'tipos'      => $tipos,
-            'como'       => 'Condiciones como las guarda Elementor: "include/general" es todo el sitio; "include/singular/front_page", la portada; "exclude/singular/page/12", todas menos la página 12. El contenido se lee y se guarda por /elementor/{id}, como una página.',
+            'plantillas'       => $lista,
+            'tipos'            => $tipos,
+            'tipos_sin_condiciones' => (object) $sin,
+            'ganadoras'        => $this->claude_plantillas_ganadoras( $g, $pagina ),
+            'revisar'          => $this->claude_plantillas_revisar(),
+            'como'             => 'Condiciones como las guarda Elementor: "include/general" es todo el sitio; "include/singular/front_page", la portada; "exclude/singular/page/12", todas menos la página 12. El contenido se lee y se guarda por /elementor/{id}, como una página. «ganadoras» dice qué plantilla se enseña en cada ubicación de una página (?pagina=id; por defecto la portada). «revisar» son plantillas con el tipo mal puesto: se arreglan con POST /elementor/plantillas/{id}/tipo.',
         ];
+    }
+
+    /** POST /elementor/plantillas/{id}/tipo {tipo, probar?}: pone el tipo y su término de taxonomía. */
+    public function claude_plantilla_tipo( \WP_REST_Request $request ) {
+        $puede = $this->claude_puede_plantillas();
+        if ( is_wp_error( $puede ) ) return $puede;
+        if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
+        $id   = (int) $request['id'];
+        $post = get_post( $id );
+        if ( ! $post || 'elementor_library' !== $post->post_type || 'trash' === $post->post_status ) {
+            return new \WP_Error( 'co_plantilla', 'No hay ninguna plantilla de la biblioteca de Elementor con ese id.', [ 'status' => 404 ] );
+        }
+        $todos = $this->claude_plantillas_tipos_todos();
+        $tipo  = sanitize_key( (string) $request->get_param( 'tipo' ) );
+        if ( ! isset( $todos[ $tipo ] ) ) {
+            return new \WP_Error( 'co_tipo', '"tipo" tiene que ser uno de: ' . implode( ', ', array_keys( $todos ) ) . '.', [ 'status' => 400 ] );
+        }
+        $antes_meta = (string) get_post_meta( $id, '_elementor_template_type', true );
+        $terms      = wp_get_object_terms( $id, 'elementor_library_type', [ 'fields' => 'slugs' ] );
+        $antes_term = is_array( $terms ) && $terms ? (string) $terms[0] : '';
+        $respuesta  = [ 'id' => $id, 'titulo' => get_the_title( $id ), 'antes' => [ 'tipo' => $antes_meta ?: null, 'termino' => $antes_term ?: null ], 'despues' => [ 'tipo' => $tipo, 'termino' => $tipo ] ];
+        if ( $antes_meta === $tipo && $antes_term === $tipo ) return $respuesta + [ 'guardado' => false, 'nota' => 'Ya estaba bien.' ];
+        if ( $request->get_param( 'probar' ) ) return $respuesta + [ 'guardado' => false ];
+
+        update_post_meta( $id, '_elementor_template_type', $tipo );
+        wp_set_object_terms( $id, $tipo, 'elementor_library_type' );
+        if ( '' === (string) get_post_meta( $id, '_elementor_edit_mode', true ) ) update_post_meta( $id, '_elementor_edit_mode', 'builder' );
+        $g = $this->claude_plantillas_gestor();
+        if ( ! is_wp_error( $g ) && method_exists( $g, 'get_cache' ) ) {
+            try { $g->get_cache()->regenerate(); } catch ( \Throwable $e ) {} // la caché de condiciones depende del tipo
+        }
+        $this->claude_refrescar( $id );
+        $this->claude_registrar( 'tipo_plantilla', $id, ( $antes_meta ?: '—' ) . ' → ' . $tipo );
+        return $respuesta + [ 'guardado' => true ];
     }
 
     /**
@@ -3195,9 +3387,15 @@ class Caracool_OneStep {
         if ( '' === $titulo ) return new \WP_Error( 'co_titulo', 'Falta "titulo".', [ 'status' => 400 ] );
 
         $tipos = $this->claude_plantillas_tipos();
+        $todos = $this->claude_plantillas_tipos_todos();
         $tipo  = sanitize_key( (string) $request->get_param( 'tipo' ) );
-        if ( ! isset( $tipos[ $tipo ] ) ) {
-            return new \WP_Error( 'co_tipo', '"tipo" tiene que ser uno de: ' . implode( ', ', array_keys( $tipos ) ) . '.', [ 'status' => 400 ] );
+        if ( ! isset( $todos[ $tipo ] ) ) {
+            return new \WP_Error( 'co_tipo', '"tipo" tiene que ser uno de: ' . implode( ', ', array_keys( $todos ) ) . '.', [ 'status' => 400 ] );
+        }
+        // 1.5.9: loop-item, section… se crean igual, pero no llevan condiciones.
+        $con_condiciones = isset( $tipos[ $tipo ] );
+        if ( ! $con_condiciones && $request->get_param( 'condiciones' ) ) {
+            return new \WP_Error( 'co_condicion', 'Una plantilla de tipo «' . $tipo . '» no lleva condiciones: se usa desde un widget (un bucle, una plantilla guardada).', [ 'status' => 400 ] );
         }
 
         $estado = (string) ( $request->get_param( 'estado' ) ?: 'draft' );
@@ -3260,7 +3458,7 @@ class Caracool_OneStep {
         }
 
         $ficha = $this->claude_plantilla_ficha( $id );
-        if ( ! $ficha['condiciones'] ) $avisos[] = 'Sin condiciones, la plantilla no se enseña en ninguna parte.';
+        if ( ! $ficha['condiciones'] && $con_condiciones ) $avisos[] = 'Sin condiciones, la plantilla no se enseña en ninguna parte.';
         if ( 'publish' !== $ficha['estado'] ) $avisos[] = 'Está en borrador: no se ve en la web hasta publicarla.';
 
         $this->claude_registrar( 'crear_plantilla', $id, $tipo . ( $ficha['condiciones'] ? ' · ' . implode( ', ', $ficha['condiciones'] ) : '' ) );
@@ -5192,6 +5390,543 @@ class Caracool_OneStep {
     }
 
     // ── Piezas internas ───────────────────────────────────────
+
+    // ── 1.5.9: ajustes de documento (página, plantilla, ventana emergente) ──
+
+    /** Ajustes que no se tocan por aquí: el CSS personalizado (regla de la casa) y el estado (va por /elementor/{id}). */
+    const DOC_PROHIBIDOS = [ 'custom_css', 'post_status' ];
+    const DOC_SIN_VALOR  = [ 'section', 'tab', 'tabs', 'heading', 'raw_html', 'divider', 'deprecated_notice', 'alert', 'notice', 'button', 'hidden' ];
+
+    private function claude_documento_doc( $id ) {
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+        if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
+        if ( (int) get_option( 'elementor_active_kit' ) === (int) $id ) {
+            return new \WP_Error( 'co_kit', 'Ese id es el Kit de la web: se lee y se cambia con /elementor/kit.', [ 'status' => 400 ] );
+        }
+        $doc = \Elementor\Plugin::$instance->documents->get( $id, false );
+        if ( ! $doc ) return new \WP_Error( 'co_documento', 'Elementor no reconoce este contenido como documento.', [ 'status' => 404 ] );
+        return $doc;
+    }
+
+    /** Las ventanas emergentes guardan disparadores y tiempos aparte: [triggers, timing] o null. */
+    private static function claude_documento_emergente( $doc ) {
+        if ( ! method_exists( $doc, 'get_display_settings_data' ) || ! method_exists( $doc, 'save_display_settings_data' ) ) return null;
+        $d = $doc->get_display_settings_data();
+        return [
+            'disparadores' => is_array( $d['triggers'] ?? null ) ? $d['triggers'] : [],
+            'tiempos'      => is_array( $d['timing'] ?? null ) ? $d['timing'] : [],
+        ];
+    }
+
+    private function claude_documento_foto( $id, $doc ) {
+        $aj = get_post_meta( $id, self::KIT_META, true );
+        return [
+            'ajustes'   => is_array( $aj ) ? $aj : [],
+            'plantilla' => (string) ( get_post_meta( $id, '_wp_page_template', true ) ?: 'default' ),
+            'emergente' => self::claude_documento_emergente( $doc ),
+        ];
+    }
+
+    private static function claude_documento_huella( array $foto ) {
+        return substr( md5( wp_json_encode( $foto ) ), 0, 16 );
+    }
+
+    /** Controles de Elementor que guardan un valor: nombre => {tipo, opciones?}. */
+    private static function claude_controles( $controles ) {
+        $out = [];
+        foreach ( (array) $controles as $k => $c ) {
+            $t = (string) ( $c['type'] ?? '' );
+            if ( in_array( $t, self::DOC_SIN_VALOR, true ) ) continue;
+            $f = [ 'tipo' => $t ];
+            if ( ! empty( $c['options'] ) && is_array( $c['options'] ) ) $f['opciones'] = array_slice( array_map( 'strval', array_keys( $c['options'] ) ), 0, 40 );
+            $out[ $k ] = $f;
+        }
+        return $out;
+    }
+
+    private static function claude_controles_emergente( $doc ) {
+        if ( ! method_exists( $doc, 'get_display_settings' ) ) return null;
+        $d = $doc->get_display_settings();
+        return [
+            'disparadores' => isset( $d['triggers'] ) && method_exists( $d['triggers'], 'get_controls' ) ? self::claude_controles( $d['triggers']->get_controls() ) : [],
+            'tiempos'      => isset( $d['timing'] ) && method_exists( $d['timing'], 'get_controls' ) ? self::claude_controles( $d['timing']->get_controls() ) : [],
+        ];
+    }
+
+    /** GET /elementor/{id}/documento[?controles=1]: ajustes del documento (y de la ventana emergente) y su «version». */
+    public function claude_documento( \WP_REST_Request $request ) {
+        $id  = (int) $request['id'];
+        $doc = $this->claude_documento_doc( $id );
+        if ( is_wp_error( $doc ) ) return $doc;
+        $foto = $this->claude_documento_foto( $id, $doc );
+        $out  = [
+            'id'        => $id,
+            'titulo'    => get_the_title( $id ),
+            'tipo'      => method_exists( $doc, 'get_name' ) ? $doc->get_name() : '',
+            'version'   => self::claude_documento_huella( $foto ),
+            'ajustes'   => (object) $foto['ajustes'],
+            'plantilla' => $foto['plantilla'],
+        ];
+        if ( null !== $foto['emergente'] ) {
+            $out['disparadores'] = (object) $foto['emergente']['disparadores'];
+            $out['tiempos']      = (object) $foto['emergente']['tiempos'];
+        }
+        if ( $request->get_param( 'controles' ) ) {
+            try {
+                $out['controles'] = self::claude_controles( $doc->get_controls() );
+                $em = self::claude_controles_emergente( $doc );
+                if ( $em ) $out['controles_emergente'] = $em;
+            } catch ( \Throwable $e ) {
+                $out['controles'] = null;
+                $out['aviso']     = 'Elementor no ha dado la lista de controles: ' . $e->getMessage();
+            }
+        }
+        $out['nota'] = 'Para cambiar: POST con {version, ajustes?, disparadores?, tiempos?, probar?}; null quita una clave. La plantilla de página es el ajuste «template» (default, elementor_canvas, elementor_header_footer); ocultar el título, «hide_title». ?controles=1 da los nombres que existen. El CSS personalizado no se toca por aquí.';
+        return $out;
+    }
+
+    /** Mezcla {clave: valor} sobre una lista, comprobando que la clave exista. null la quita. */
+    private static function claude_documento_mezclar( array $actual, $pedidos, array $validas, $que, array &$cambios ) {
+        if ( null === $pedidos ) return $actual;
+        if ( ! is_array( $pedidos ) ) throw new \InvalidArgumentException( '«' . $que . '» es un objeto {ajuste: valor}.' );
+        foreach ( $pedidos as $k => $v ) {
+            $k = (string) $k;
+            if ( in_array( $k, self::DOC_PROHIBIDOS, true ) ) {
+                throw new \InvalidArgumentException( 'custom_css' === $k ? 'El CSS personalizado no se toca: es regla de la casa (cero CSS personalizado).' : 'El estado se cambia guardando la página con «estado», no aquí.' );
+            }
+            if ( '__globals__' !== $k && $validas && ! isset( $validas[ $k ] ) ) {
+                throw new \InvalidArgumentException( '«' . $que . '.' . $k . '» no es un ajuste de este documento (pide ?controles=1 para ver los que hay).' );
+            }
+        }
+        $nuevo = self::claude_fusionar_ajustes( $actual, $pedidos );
+        foreach ( array_unique( array_merge( array_keys( $actual ), array_keys( $nuevo ) ) ) as $k ) {
+            $a = $actual[ $k ] ?? null;
+            $d = $nuevo[ $k ] ?? null;
+            if ( wp_json_encode( $a ) !== wp_json_encode( $d ) ) $cambios[ $que . '.' . $k ] = [ 'antes' => $a, 'despues' => $d ];
+        }
+        return $nuevo;
+    }
+
+    /** POST /elementor/{id}/documento {version, ajustes?, disparadores?, tiempos?, probar?, forzar?}. */
+    public function claude_documento_guardar( \WP_REST_Request $request ) {
+        $id  = (int) $request['id'];
+        $doc = $this->claude_documento_doc( $id );
+        if ( is_wp_error( $doc ) ) return $doc;
+        if ( ! $doc->is_editable_by_current_user() ) {
+            return new \WP_Error( 'co_permiso', 'Elementor no deja editar este contenido al usuario de Claude.', [ 'status' => 403 ] );
+        }
+        $lock = $this->claude_bloqueo( $id );
+        if ( $lock && ! $request->get_param( 'forzar' ) ) {
+            return new \WP_Error( 'co_bloqueada', sprintf( '%s lo tiene abierto en el editor ahora mismo. Espera a que lo cierre.', $lock->display_name ), [ 'status' => 423 ] );
+        }
+        $foto = $this->claude_documento_foto( $id, $doc );
+        $v    = (string) $request->get_param( 'version' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta "version": lee el documento antes (GET /elementor/{id}/documento).', [ 'status' => 428 ] );
+        if ( ! hash_equals( self::claude_documento_huella( $foto ), $v ) ) return new \WP_Error( 'co_cambiada', 'Los ajustes han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
+
+        $p_aj  = $request->get_param( 'ajustes' );
+        $p_dis = $request->get_param( 'disparadores' );
+        $p_tie = $request->get_param( 'tiempos' );
+        if ( null === $p_aj && null === $p_dis && null === $p_tie ) {
+            return new \WP_Error( 'co_documento', 'No hay nada que cambiar: manda «ajustes», «disparadores» o «tiempos».', [ 'status' => 400 ] );
+        }
+        if ( ( null !== $p_dis || null !== $p_tie ) && null === $foto['emergente'] ) {
+            return new \WP_Error( 'co_documento', 'Disparadores y tiempos son solo de las ventanas emergentes.', [ 'status' => 400 ] );
+        }
+
+        $cambios = [];
+        try {
+            $validas = null !== $p_aj ? self::claude_controles( $doc->get_controls() ) : [];
+            $nuevos  = self::claude_documento_mezclar( $foto['ajustes'], $p_aj, $validas, 'ajustes', $cambios );
+            $em_ctrl = null !== $foto['emergente'] && ( null !== $p_dis || null !== $p_tie ) ? self::claude_controles_emergente( $doc ) : null;
+            $dis     = null !== $foto['emergente'] ? self::claude_documento_mezclar( $foto['emergente']['disparadores'], $p_dis, $em_ctrl['disparadores'] ?? [], 'disparadores', $cambios ) : null;
+            $tie     = null !== $foto['emergente'] ? self::claude_documento_mezclar( $foto['emergente']['tiempos'], $p_tie, $em_ctrl['tiempos'] ?? [], 'tiempos', $cambios ) : null;
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_documento', $e->getMessage(), [ 'status' => 400 ] );
+        } catch ( \Throwable $e ) {
+            return new \WP_Error( 'co_documento', 'Elementor ha dado un error al leer los controles: ' . $e->getMessage() . '. No se ha guardado nada.', [ 'status' => 500 ] );
+        }
+
+        $respuesta = [ 'id' => $id, 'cambios' => (object) $cambios ];
+        if ( $request->get_param( 'probar' ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => $v ];
+        }
+
+        $revision = $this->claude_crear_revision( $id );
+        $hay_aj   = false;
+        foreach ( array_keys( $cambios ) as $k ) if ( 0 === strpos( $k, 'ajustes.' ) ) $hay_aj = true;
+        try {
+            if ( $hay_aj ) {
+                if ( $nuevos ) {
+                    // save() sustituye todos los ajustes por los que recibe: van todos.
+                    if ( ! $doc->save( [ 'settings' => $nuevos ] ) ) {
+                        return new \WP_Error( 'co_guardar', 'Elementor no ha guardado los ajustes.', [ 'status' => 500 ] );
+                    }
+                } else {
+                    delete_post_meta( $id, self::KIT_META ); // save() no hace nada con ajustes vacíos
+                }
+            }
+            if ( null !== $dis && ( null !== $p_dis || null !== $p_tie ) ) {
+                $doc->save_display_settings_data( [ 'triggers' => $dis, 'timing' => $tie ] );
+            }
+        } catch ( \Throwable $e ) {
+            return new \WP_Error( 'co_guardar', 'Elementor ha dado un error al guardar: ' . $e->getMessage(), [ 'status' => 500 ] );
+        }
+        $this->claude_refrescar( $id );
+        $this->claude_registrar( 'documento', $id, implode( ', ', array_keys( $cambios ) ) );
+        $doc2 = \Elementor\Plugin::$instance->documents->get( $id, false );
+        return $respuesta + [
+            'guardado' => true,
+            'revision' => $revision,
+            'version'  => $doc2 ? self::claude_documento_huella( $this->claude_documento_foto( $id, $doc2 ) ) : '',
+            'url'      => get_permalink( $id ),
+        ];
+    }
+
+    // ── 1.5.9: opciones de plugins, con lista blanca ──
+
+    private static function claude_plugin_activo( $archivo ) {
+        if ( ! function_exists( 'is_plugin_active' ) ) require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        return is_plugin_active( $archivo );
+    }
+
+    /**
+     * Lo único que se deja cambiar de cada plugin. nombre corto => [opción,
+     * subclave o null, tipo, valores]. Nada de claves de pago, licencias,
+     * seguridad o HTML/código libre.
+     */
+    private function claude_opciones_catalogo() {
+        $roles = array_keys( (array) wp_roles()->roles );
+        $os    = self::OPTION_KEY;
+        $cat   = [
+            'safe-svg' => [
+                'nombre' => 'Safe SVG',
+                'activo' => self::claude_plugin_activo( 'safe-svg/safe-svg.php' ),
+                'campos' => [
+                    'roles'            => [ 'safe_svg_upload_roles', null, 'roles', $roles ],
+                    'archivos_grandes' => [ 'safe_svg_large_svg', null, 'bool01', null ],
+                ],
+                'nota'   => 'Con Safe SVG activo, los SVG que sube «subir_medio» pasan por su limpieza. «roles» son los roles que pueden subir SVG (vacío = los que pueden subir archivos).',
+            ],
+            'mantenimiento' => [
+                'nombre' => 'Modo mantenimiento de Caracool OneStep',
+                'activo' => true,
+                'campos' => [
+                    'activo'      => [ $os, 'maintenance_enabled', 'bool', null ],
+                    'codigo_http' => [ $os, 'maintenance_http_status', 'enum', [ 503, 200, 404, 301 ] ],
+                    'redireccion' => [ $os, 'maintenance_redirect_url', 'url', null ],
+                    'titulo'      => [ $os, 'maintenance_title', 'texto', null ],
+                    'encabezado'  => [ $os, 'maintenance_heading', 'texto', null ],
+                    'mensaje'     => [ $os, 'maintenance_message', 'parrafo', null ],
+                    'logo'        => [ $os, 'maintenance_logo_url', 'url', null ],
+                    'color_fondo' => [ $os, 'maintenance_bg_color', 'color', null ],
+                    'color_texto' => [ $os, 'maintenance_text_color', 'color', null ],
+                    'rol_minimo'  => [ $os, 'maintenance_bypass_role', 'enum', array_merge( [ '' ], self::ROLE_ORDER ) ],
+                ],
+                'nota'   => 'Cerrar la web: activo=true. Con 503 solo la ven los usuarios del rol mínimo; con 301 redirige a «redireccion». El HTML personalizado y la lista de IPs se cambian en el panel.',
+            ],
+        ];
+        // Yoast: solo títulos, descripciones, noindex de plantillas y migas de pan.
+        $yoast = [ 'nombre' => 'Yoast SEO (títulos y migas)', 'activo' => self::claude_plugin_activo( 'wordpress-seo/wp-seo.php' ), 'campos' => [], 'nota' => 'Plantillas de título y descripción por tipo de contenido (%%title%% %%sep%% %%sitename%%), noindex por tipo y las migas de pan. El resto de Yoast se cambia en su panel.' ];
+        $t = get_option( 'wpseo_titles' );
+        if ( is_array( $t ) ) {
+            foreach ( $t as $k => $v ) {
+                if ( ! preg_match( '/^(title|metadesc|noindex|breadcrumbs)-|^separator$/', (string) $k ) ) continue;
+                $tipo = is_bool( $v ) ? 'bool' : ( is_int( $v ) ? 'entero' : 'texto' );
+                $yoast['campos'][ (string) $k ] = [ 'wpseo_titles', (string) $k, $tipo, null ];
+            }
+        }
+        $cat['yoast'] = $yoast;
+        return $cat;
+    }
+
+    private static function claude_opcion_valor( $campo ) {
+        list( $opcion, $sub ) = $campo;
+        $v = get_option( $opcion );
+        if ( null === $sub ) return $v;
+        return is_array( $v ) && array_key_exists( $sub, $v ) ? $v[ $sub ] : null;
+    }
+
+    /** Valida y normaliza un valor según su tipo. Lanza InvalidArgumentException. */
+    private static function claude_opcion_normalizar( $nombre, $campo, $v ) {
+        list( , , $tipo, $valores ) = $campo;
+        $mal = function ( $m ) use ( $nombre ) { throw new \InvalidArgumentException( '«' . $nombre . '» ' . $m ); };
+        switch ( $tipo ) {
+            case 'bool':
+                if ( ! is_bool( $v ) ) $mal( 'es true o false.' );
+                return $v;
+            case 'bool01':
+                if ( ! is_bool( $v ) && ! in_array( $v, [ 0, 1 ], true ) ) $mal( 'es true o false.' );
+                return $v ? 1 : 0;
+            case 'entero':
+                if ( ! is_int( $v ) ) $mal( 'es un número entero.' );
+                return $v;
+            case 'enum':
+                foreach ( (array) $valores as $ok ) if ( $ok === $v || ( is_int( $ok ) && is_numeric( $v ) && (int) $v === $ok ) ) return $ok;
+                $mal( 'tiene que ser uno de: ' . implode( ', ', array_map( function ( $x ) { return '' === $x ? '«» (cualquiera con sesión)' : (string) $x; }, (array) $valores ) ) . '.' );
+            case 'roles':
+                if ( ! is_array( $v ) ) $mal( 'es una lista de roles.' );
+                foreach ( $v as $r ) if ( ! in_array( $r, (array) $valores, true ) ) $mal( 'tiene un rol que no existe: ' . ( is_scalar( $r ) ? $r : '?' ) . '. Hay: ' . implode( ', ', (array) $valores ) . '.' );
+                return array_values( array_unique( $v ) );
+            case 'url':
+                if ( ! is_string( $v ) ) $mal( 'es una dirección.' );
+                if ( '' === $v ) return '';
+                $u = esc_url_raw( $v, [ 'http', 'https' ] );
+                if ( '' === $u ) $mal( 'no es una dirección http(s) válida.' );
+                return $u;
+            case 'color':
+                $c = is_string( $v ) ? sanitize_hex_color( $v ) : null;
+                if ( ! $c ) $mal( 'es un color #rrggbb.' );
+                return $c;
+            case 'parrafo':
+                if ( ! is_string( $v ) ) $mal( 'es un texto.' );
+                return sanitize_textarea_field( $v );
+            default: // texto
+                if ( ! is_string( $v ) ) $mal( 'es un texto.' );
+                return sanitize_text_field( $v );
+        }
+    }
+
+    /** GET /plugins/opciones[?plugin=x]: sin plugin, la lista; con él, sus ajustes y «version». */
+    public function claude_opciones_plugin( \WP_REST_Request $request ) {
+        if ( ! current_user_can( 'manage_options' ) ) return new \WP_Error( 'co_permiso', 'Las opciones de los plugins solo las toca un Administrador.', [ 'status' => 403 ] );
+        $cat = $this->claude_opciones_catalogo();
+        $p   = sanitize_key( (string) $request->get_param( 'plugin' ) );
+        if ( '' === $p ) {
+            $lista = [];
+            foreach ( $cat as $k => $c ) $lista[ $k ] = [ 'nombre' => $c['nombre'], 'activo' => $c['activo'], 'ajustes' => count( $c['campos'] ) ];
+            return [ 'plugins' => $lista, 'nota' => 'Pide uno con ?plugin=. Solo se pueden cambiar estos ajustes; nada de licencias, claves ni seguridad. La caché no está: depende del plugin de cada web.' ];
+        }
+        if ( ! isset( $cat[ $p ] ) ) return new \WP_Error( 'co_plugin', 'No hay ajustes de «' . $p . '» en la lista blanca. Hay: ' . implode( ', ', array_keys( $cat ) ) . '.', [ 'status' => 404 ] );
+        $c = $cat[ $p ];
+        if ( ! $c['activo'] ) return new \WP_Error( 'co_plugin_inactivo', $c['nombre'] . ' no está activo en esta web.', [ 'status' => 404 ] );
+        $valores = [];
+        $tipos   = [];
+        foreach ( $c['campos'] as $n => $campo ) {
+            $valores[ $n ] = self::claude_opcion_valor( $campo );
+            $tipos[ $n ]   = $campo[3] ? [ 'tipo' => $campo[2], 'valores' => $campo[3] ] : [ 'tipo' => $campo[2] ];
+        }
+        return [ 'plugin' => $p, 'nombre' => $c['nombre'], 'version' => substr( md5( wp_json_encode( $valores ) ), 0, 16 ), 'ajustes' => (object) $valores, 'tipos' => (object) $tipos, 'nota' => $c['nota'] ];
+    }
+
+    /** POST /plugins/opciones {plugin, version, ajustes, probar?}. Todo se comprueba antes de guardar nada. */
+    public function claude_opciones_plugin_guardar( \WP_REST_Request $request ) {
+        if ( ! current_user_can( 'manage_options' ) ) return new \WP_Error( 'co_permiso', 'Las opciones de los plugins solo las toca un Administrador.', [ 'status' => 403 ] );
+        $cat = $this->claude_opciones_catalogo();
+        $p   = sanitize_key( (string) $request->get_param( 'plugin' ) );
+        if ( ! isset( $cat[ $p ] ) ) return new \WP_Error( 'co_plugin', 'No hay ajustes de «' . $p . '» en la lista blanca. Hay: ' . implode( ', ', array_keys( $cat ) ) . '.', [ 'status' => 404 ] );
+        $c = $cat[ $p ];
+        if ( ! $c['activo'] ) return new \WP_Error( 'co_plugin_inactivo', $c['nombre'] . ' no está activo en esta web.', [ 'status' => 404 ] );
+        $valores = [];
+        foreach ( $c['campos'] as $n => $campo ) $valores[ $n ] = self::claude_opcion_valor( $campo );
+        $v = (string) $request->get_param( 'version' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» (la da GET /plugins/opciones?plugin=' . $p . ').', [ 'status' => 428 ] );
+        if ( ! hash_equals( substr( md5( wp_json_encode( $valores ) ), 0, 16 ), $v ) ) return new \WP_Error( 'co_cambiada', 'Los ajustes han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
+        $pedidos = $request->get_param( 'ajustes' );
+        if ( ! is_array( $pedidos ) || ! $pedidos ) return new \WP_Error( 'co_plugin', 'Faltan los «ajustes» que cambiar: {ajuste: valor}.', [ 'status' => 400 ] );
+
+        $cambios = [];
+        $nuevos  = [];
+        try {
+            foreach ( $pedidos as $n => $val ) {
+                if ( ! isset( $c['campos'][ $n ] ) ) throw new \InvalidArgumentException( '«' . $n . '» no se puede cambiar por aquí. Se puede: ' . implode( ', ', array_keys( $c['campos'] ) ) . '.' );
+                $norm = self::claude_opcion_normalizar( $n, $c['campos'][ $n ], $val );
+                if ( wp_json_encode( $norm ) !== wp_json_encode( $valores[ $n ] ) ) {
+                    $cambios[ $n ] = [ 'antes' => $valores[ $n ], 'despues' => $norm ];
+                    $nuevos[ $n ]  = $norm;
+                }
+            }
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_plugin', $e->getMessage() . ' No se ha guardado nada.', [ 'status' => 400 ] );
+        }
+        $respuesta = [ 'plugin' => $p, 'cambios' => (object) $cambios ];
+        if ( $request->get_param( 'probar' ) || ! $cambios ) return $respuesta + [ 'guardado' => false, 'version' => $v ];
+
+        // Agrupa por opción para escribir cada una una sola vez.
+        $por_opcion = [];
+        foreach ( $nuevos as $n => $norm ) {
+            list( $opcion, $sub ) = $c['campos'][ $n ];
+            if ( null === $sub ) { $por_opcion[ $opcion ] = [ '__entera' => $norm ]; continue; }
+            $por_opcion[ $opcion ][ $sub ] = $norm;
+        }
+        foreach ( $por_opcion as $opcion => $subs ) {
+            if ( array_key_exists( '__entera', $subs ) ) { update_option( $opcion, $subs['__entera'] ); continue; }
+            $actual = get_option( $opcion );
+            $actual = is_array( $actual ) ? $actual : [];
+            update_option( $opcion, array_merge( $actual, $subs ) );
+        }
+        $this->claude_registrar( 'opciones_plugin', 0, $p . ': ' . implode( ', ', array_keys( $cambios ) ) );
+        $ahora = [];
+        foreach ( $c['campos'] as $n => $campo ) $ahora[ $n ] = self::claude_opcion_valor( $campo );
+        return $respuesta + [ 'guardado' => true, 'version' => substr( md5( wp_json_encode( $ahora ) ), 0, 16 ) ];
+    }
+
+    // ── 1.5.9: redirecciones del plugin Redirection ──
+
+    private function claude_redir_listo() {
+        if ( ! current_user_can( 'manage_options' ) ) return new \WP_Error( 'co_permiso', 'Las redirecciones solo las toca un Administrador.', [ 'status' => 403 ] );
+        if ( ! class_exists( 'Red_Item' ) ) return new \WP_Error( 'co_sin_redirection', 'Esta web no tiene activo el plugin Redirection (se instala con instalar_plugin, slug «redirection»).', [ 'status' => 404 ] );
+        return true;
+    }
+
+    private static function claude_redir_tabla_existe( $tabla ) {
+        global $wpdb;
+        return $tabla === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $tabla ) );
+    }
+
+    /** La forma en que Redirection compara las URLs de origen. */
+    private static function claude_redir_clave( $url ) {
+        if ( class_exists( 'Red_Url_Match' ) ) {
+            try { return ( new \Red_Url_Match( $url ) )->get_url(); } catch ( \Throwable $e ) {}
+        }
+        return strtolower( untrailingslashit( $url ) ?: '/' );
+    }
+
+    /** Una ruta o URL de esta web, como ruta (/algo/). Lanza InvalidArgumentException. */
+    private static function claude_redir_origen( $v ) {
+        $v = is_string( $v ) ? trim( $v ) : '';
+        if ( preg_match( '#^https?://#i', $v ) ) {
+            $host = wp_parse_url( home_url(), PHP_URL_HOST );
+            $h    = wp_parse_url( $v, PHP_URL_HOST );
+            if ( strtolower( (string) $h ) !== strtolower( (string) $host ) && strtolower( (string) $h ) !== 'www.' . strtolower( (string) $host ) && 'www.' . strtolower( (string) $h ) !== strtolower( (string) $host ) ) {
+                throw new \InvalidArgumentException( 'el origen «' . $v . '» no es de esta web' );
+            }
+            $q = wp_parse_url( $v, PHP_URL_QUERY );
+            $v = (string) wp_parse_url( $v, PHP_URL_PATH ) . ( $q ? '?' . $q : '' );
+        }
+        if ( '' === $v || '/' !== $v[0] ) throw new \InvalidArgumentException( 'el origen tiene que ser una ruta que empiece por / (o una URL de esta web)' );
+        if ( preg_match( '/[\s<>"]/', $v ) ) throw new \InvalidArgumentException( 'el origen «' . $v . '» lleva espacios o caracteres raros' );
+        return $v;
+    }
+
+    private static function claude_redir_destino( $v ) {
+        $v = is_string( $v ) ? trim( $v ) : '';
+        if ( '' !== $v && '/' === $v[0] && ! preg_match( '/[\s<>"]/', $v ) ) return $v;
+        $u = esc_url_raw( $v, [ 'http', 'https' ] );
+        if ( '' === $u || $u !== $v ) throw new \InvalidArgumentException( 'el destino «' . $v . '» tiene que ser una ruta (/algo/) o una URL http(s)' );
+        return $u;
+    }
+
+    /** GET /redirecciones[?buscar=&pagina=]: las redirecciones, los grupos y los 404 más vistos. */
+    public function claude_redirecciones( \WP_REST_Request $request ) {
+        $ok = $this->claude_redir_listo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        global $wpdb;
+        $ti     = $wpdb->prefix . 'redirection_items';
+        $tg     = $wpdb->prefix . 'redirection_groups';
+        $t4     = $wpdb->prefix . 'redirection_404';
+        $buscar = sanitize_text_field( (string) $request->get_param( 'buscar' ) );
+        $pagina = max( 1, (int) $request->get_param( 'pagina' ) );
+        $where  = $buscar ? $wpdb->prepare( 'WHERE url LIKE %s OR action_data LIKE %s', '%' . $wpdb->esc_like( $buscar ) . '%', '%' . $wpdb->esc_like( $buscar ) . '%' ) : '';
+        $total  = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$ti} {$where}" ); // phpcs:ignore WordPress.DB.PreparedSQL
+        $filas  = $wpdb->get_results( $wpdb->prepare( "SELECT id, url, action_type, action_code, action_data, status, last_count, group_id, regex FROM {$ti} {$where} ORDER BY id DESC LIMIT 100 OFFSET %d", ( $pagina - 1 ) * 100 ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL
+        $items  = [];
+        foreach ( (array) $filas as $f ) {
+            $items[] = [
+                'id'      => (int) $f['id'],
+                'origen'  => $f['url'],
+                'destino' => 'url' === $f['action_type'] ? maybe_unserialize( $f['action_data'] ) : '(' . $f['action_type'] . ')',
+                'codigo'  => (int) $f['action_code'],
+                'activa'  => 'enabled' === $f['status'],
+                'visitas' => (int) $f['last_count'],
+                'grupo'   => (int) $f['group_id'],
+                'regex'   => (bool) $f['regex'],
+            ];
+        }
+        $grupos = $wpdb->get_results( "SELECT id, name AS nombre, module_id AS modulo, status FROM {$tg} ORDER BY id", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL
+        $e404   = self::claude_redir_tabla_existe( $t4 )
+            ? $wpdb->get_results( "SELECT url, COUNT(*) AS veces, MAX(created) AS ultima FROM {$t4} GROUP BY url ORDER BY veces DESC LIMIT 30", ARRAY_A ) // phpcs:ignore WordPress.DB.PreparedSQL
+            : [];
+        return [
+            'total'       => $total,
+            'pagina'      => $pagina,
+            'paginas'     => (int) ceil( $total / 100 ),
+            'redirecciones' => $items,
+            'grupos'      => $grupos,
+            'errores_404' => array_map( function ( $r ) { return [ 'url' => $r['url'], 'veces' => (int) $r['veces'], 'ultima' => $r['ultima'] ]; }, (array) $e404 ),
+        ];
+    }
+
+    /**
+     * POST /redirecciones {crear:[{origen, destino, codigo?}], grupo?, probar?}:
+     * crea redirecciones con la función del propio Redirection. No toca las
+     * que ya existen: las que coinciden salen en «ya_estaban» y las que
+     * apuntan a otro sitio, en «choques».
+     */
+    public function claude_redirecciones_guardar( \WP_REST_Request $request ) {
+        $ok = $this->claude_redir_listo();
+        if ( is_wp_error( $ok ) ) return $ok;
+        global $wpdb;
+        $lista = $request->get_param( 'crear' );
+        if ( ! is_array( $lista ) || ! $lista ) return new \WP_Error( 'co_redir', 'Falta «crear»: una lista de {origen, destino, codigo?}.', [ 'status' => 400 ] );
+        if ( count( $lista ) > 500 ) return new \WP_Error( 'co_redir', 'Como mucho 500 de una vez.', [ 'status' => 400 ] );
+
+        $tg    = $wpdb->prefix . 'redirection_groups';
+        $grupo = (int) $request->get_param( 'grupo' );
+        if ( $grupo ) {
+            if ( ! $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$tg} WHERE id = %d", $grupo ) ) ) return new \WP_Error( 'co_redir', 'No hay ningún grupo de Redirection con el id ' . $grupo . '.', [ 'status' => 400 ] ); // phpcs:ignore WordPress.DB.PreparedSQL
+        } else {
+            $grupo = (int) $wpdb->get_var( "SELECT id FROM {$tg} WHERE module_id = 1 AND status = 'enabled' ORDER BY id LIMIT 1" ); // phpcs:ignore WordPress.DB.PreparedSQL
+            if ( ! $grupo ) return new \WP_Error( 'co_redir', 'Redirection no tiene ningún grupo de WordPress activo: créalo en su panel o pasa «grupo».', [ 'status' => 400 ] );
+        }
+
+        $ti      = $wpdb->prefix . 'redirection_items';
+        $nuevas  = [];
+        $ya      = [];
+        $choques = [];
+        $errores = [];
+        $vistos  = [];
+        foreach ( $lista as $n => $r ) {
+            try {
+                if ( ! is_array( $r ) ) throw new \InvalidArgumentException( 'cada una es {origen, destino, codigo?}' );
+                $origen  = self::claude_redir_origen( $r['origen'] ?? '' );
+                $destino = self::claude_redir_destino( $r['destino'] ?? '' );
+                $codigo  = (int) ( $r['codigo'] ?? 301 );
+                if ( ! in_array( $codigo, [ 301, 302, 307, 308 ], true ) ) throw new \InvalidArgumentException( 'el código es 301, 302, 307 o 308' );
+                $clave = self::claude_redir_clave( $origen );
+                if ( self::claude_redir_clave( $destino ) === $clave ) throw new \InvalidArgumentException( 'origen y destino son la misma dirección (sería un bucle)' );
+                if ( isset( $vistos[ $clave ] ) ) throw new \InvalidArgumentException( 'el origen «' . $origen . '» está repetido en la lista (fila ' . ( $vistos[ $clave ] + 1 ) . ')' );
+                $vistos[ $clave ] = $n;
+                $existe = $wpdb->get_row( $wpdb->prepare( "SELECT id, action_type, action_data, action_code FROM {$ti} WHERE match_url = %s AND regex = 0 LIMIT 1", $clave ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL
+                if ( $existe ) {
+                    $dest_actual = 'url' === $existe['action_type'] ? (string) maybe_unserialize( $existe['action_data'] ) : '';
+                    $fila = [ 'origen' => $origen, 'destino' => $destino, 'id' => (int) $existe['id'], 'destino_actual' => $dest_actual, 'codigo_actual' => (int) $existe['action_code'] ];
+                    if ( untrailingslashit( $dest_actual ) === untrailingslashit( $destino ) ) $ya[] = $fila; else $choques[] = $fila;
+                    continue;
+                }
+                $nuevas[] = [ 'origen' => $origen, 'destino' => $destino, 'codigo' => $codigo ];
+            } catch ( \InvalidArgumentException $e ) {
+                $errores[] = [ 'fila' => $n + 1, 'error' => $e->getMessage() ];
+            }
+        }
+        $respuesta = [ 'grupo' => $grupo, 'nuevas' => count( $nuevas ), 'ya_estaban' => $ya, 'choques' => $choques, 'errores' => $errores ];
+        if ( $request->get_param( 'probar' ) || $errores ) {
+            $respuesta['guardado'] = false;
+            $respuesta['lista']    = array_slice( $nuevas, 0, 50 );
+            if ( $errores ) $respuesta['nota'] = 'Hay filas con errores: corrígelas y vuelve a mandar la lista. No se ha creado nada.';
+            return $respuesta;
+        }
+        $creadas = [];
+        foreach ( $nuevas as $r ) {
+            $item = \Red_Item::create( [
+                'url'         => $r['origen'],
+                'match_type'  => 'url',
+                'action_type' => 'url',
+                'action_code' => $r['codigo'],
+                'action_data' => [ 'url' => $r['destino'] ],
+                'group_id'    => $grupo,
+                'regex'       => 0,
+            ] );
+            if ( is_wp_error( $item ) ) {
+                $errores[] = [ 'origen' => $r['origen'], 'error' => $item->get_error_message() ];
+                continue;
+            }
+            $creadas[] = [ 'id' => is_object( $item ) && method_exists( $item, 'get_id' ) ? (int) $item->get_id() : null ] + $r;
+        }
+        $this->claude_registrar( 'redirecciones', 0, count( $creadas ) . ' creadas' . ( $errores ? ', ' . count( $errores ) . ' con error' : '' ) );
+        return array_merge( $respuesta, [ 'guardado' => true, 'creadas' => $creadas, 'errores' => $errores ] );
+    }
 
     private function claude_elementor_listo() {
         return class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance ) && defined( 'ELEMENTOR_VERSION' );
