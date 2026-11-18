@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.9
+ * Version:     1.5.10
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.9' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.10' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -3244,6 +3244,7 @@ class Caracool_OneStep {
         foreach ( (array) ( method_exists( $docs, 'get_document_types' ) ? $docs->get_document_types() : [] ) as $tipo => $clase ) {
             try {
                 if ( ! is_string( $tipo ) || in_array( $tipo, [ 'kit', 'wp-post', 'wp-page', 'not-supported', 'landing-page', 'cloud-template-preview' ], true ) ) continue;
+                if ( 0 === strpos( $tipo, 'e-' ) ) continue; // tipos internos de los elementos atómicos de Elementor
                 if ( ! in_array( 'elementor_library', (array) $clase::get_property( 'cpt' ), true ) ) continue;
                 if ( false === $clase::get_property( 'show_in_library' ) && ! $clase::get_property( 'support_conditions' ) && 'loop-item' !== $tipo ) continue;
                 $tipos[ $tipo ] = [
@@ -3267,6 +3268,7 @@ class Caracool_OneStep {
         $ids = get_posts( [ 'post_type' => 'elementor_library', 'post_status' => [ 'publish', 'draft', 'private', 'pending' ], 'numberposts' => 300, 'fields' => 'ids', 'suppress_filters' => true ] );
         foreach ( (array) $ids as $id ) {
             $meta    = (string) get_post_meta( $id, '_elementor_template_type', true );
+            if ( 'kit' === $meta ) continue; // el Kit no lleva término y no es una plantilla
             $terms   = wp_get_object_terms( $id, 'elementor_library_type', [ 'fields' => 'slugs' ] );
             $termino = is_array( $terms ) && $terms ? (string) $terms[0] : '';
             if ( '' !== $meta && $meta === $termino ) continue;
@@ -5422,7 +5424,7 @@ class Caracool_OneStep {
     private function claude_documento_foto( $id, $doc ) {
         $aj = get_post_meta( $id, self::KIT_META, true );
         return [
-            'ajustes'   => is_array( $aj ) ? $aj : [],
+            'ajustes'   => is_array( $aj ) ? $aj : [], // la plantilla de página va aparte: _wp_page_template
             'plantilla' => (string) ( get_post_meta( $id, '_wp_page_template', true ) ?: 'default' ),
             'emergente' => self::claude_documento_emergente( $doc ),
         ];
@@ -5538,7 +5540,11 @@ class Caracool_OneStep {
         $cambios = [];
         try {
             $validas = null !== $p_aj ? self::claude_controles( $doc->get_controls() ) : [];
-            $nuevos  = self::claude_documento_mezclar( $foto['ajustes'], $p_aj, $validas, 'ajustes', $cambios );
+            // La plantilla de página la guarda WordPress en _wp_page_template, no en los ajustes:
+            // se compara con la de verdad para que el «antes» no salga vacío.
+            $base_aj = $foto['ajustes'];
+            if ( isset( $validas['template'] ) && ! isset( $base_aj['template'] ) ) $base_aj['template'] = $foto['plantilla'];
+            $nuevos  = self::claude_documento_mezclar( $base_aj, $p_aj, $validas, 'ajustes', $cambios );
             $em_ctrl = null !== $foto['emergente'] && ( null !== $p_dis || null !== $p_tie ) ? self::claude_controles_emergente( $doc ) : null;
             $dis     = null !== $foto['emergente'] ? self::claude_documento_mezclar( $foto['emergente']['disparadores'], $p_dis, $em_ctrl['disparadores'] ?? [], 'disparadores', $cambios ) : null;
             $tie     = null !== $foto['emergente'] ? self::claude_documento_mezclar( $foto['emergente']['tiempos'], $p_tie, $em_ctrl['tiempos'] ?? [], 'tiempos', $cambios ) : null;
@@ -5641,9 +5647,10 @@ class Caracool_OneStep {
         return $cat;
     }
 
-    private static function claude_opcion_valor( $campo ) {
+    private function claude_opcion_valor( $campo ) {
         list( $opcion, $sub ) = $campo;
-        $v = get_option( $opcion );
+        // Los ajustes de OneStep, con sus valores por defecto (como los ve el panel).
+        $v = self::OPTION_KEY === $opcion ? $this->get_settings() : get_option( $opcion );
         if ( null === $sub ) return $v;
         return is_array( $v ) && array_key_exists( $sub, $v ) ? $v[ $sub ] : null;
     }
@@ -5704,7 +5711,7 @@ class Caracool_OneStep {
         $valores = [];
         $tipos   = [];
         foreach ( $c['campos'] as $n => $campo ) {
-            $valores[ $n ] = self::claude_opcion_valor( $campo );
+            $valores[ $n ] = $this->claude_opcion_valor( $campo );
             $tipos[ $n ]   = $campo[3] ? [ 'tipo' => $campo[2], 'valores' => $campo[3] ] : [ 'tipo' => $campo[2] ];
         }
         return [ 'plugin' => $p, 'nombre' => $c['nombre'], 'version' => substr( md5( wp_json_encode( $valores ) ), 0, 16 ), 'ajustes' => (object) $valores, 'tipos' => (object) $tipos, 'nota' => $c['nota'] ];
@@ -5719,7 +5726,7 @@ class Caracool_OneStep {
         $c = $cat[ $p ];
         if ( ! $c['activo'] ) return new \WP_Error( 'co_plugin_inactivo', $c['nombre'] . ' no está activo en esta web.', [ 'status' => 404 ] );
         $valores = [];
-        foreach ( $c['campos'] as $n => $campo ) $valores[ $n ] = self::claude_opcion_valor( $campo );
+        foreach ( $c['campos'] as $n => $campo ) $valores[ $n ] = $this->claude_opcion_valor( $campo );
         $v = (string) $request->get_param( 'version' );
         if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» (la da GET /plugins/opciones?plugin=' . $p . ').', [ 'status' => 428 ] );
         if ( ! hash_equals( substr( md5( wp_json_encode( $valores ) ), 0, 16 ), $v ) ) return new \WP_Error( 'co_cambiada', 'Los ajustes han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
@@ -5758,7 +5765,7 @@ class Caracool_OneStep {
         }
         $this->claude_registrar( 'opciones_plugin', 0, $p . ': ' . implode( ', ', array_keys( $cambios ) ) );
         $ahora = [];
-        foreach ( $c['campos'] as $n => $campo ) $ahora[ $n ] = self::claude_opcion_valor( $campo );
+        foreach ( $c['campos'] as $n => $campo ) $ahora[ $n ] = $this->claude_opcion_valor( $campo );
         return $respuesta + [ 'guardado' => true, 'version' => substr( md5( wp_json_encode( $ahora ) ), 0, 16 ) ];
     }
 
