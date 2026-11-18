@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.6
+ * Version:     1.5.7
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.6' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.7' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1824,8 +1824,21 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/motion', [
             'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_motion' ], 'permission_callback' => $perm,
         ] );
+        // 1.5.7: el Kit también se guarda (colores, tipografías y Estilo del tema), con copias para volver atrás.
         register_rest_route( $ns, '/elementor/kit', [
-            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_kit' ], 'permission_callback' => $perm,
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_kit' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_kit_guardar' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/elementor/kit/copias', [
+            'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_kit_copias' ], 'permission_callback' => $perm,
+        ] );
+        register_rest_route( $ns, '/elementor/kit/copias/(?P<i>\d+)', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_kit_restaurar' ], 'permission_callback' => $perm,
+        ] );
+        // 1.5.7: los ajustes del panel de Caracool → Motion (botones, cabecera, intro, scroll…).
+        register_rest_route( $ns, '/motion/ajustes', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_motion_ajustes' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_motion_ajustes_guardar' ], 'permission_callback' => $perm ],
         ] );
         register_rest_route( $ns, '/elementor/cache', [
             'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_limpiar_cache' ], 'permission_callback' => $perm,
@@ -2103,35 +2116,777 @@ class Caracool_OneStep {
         return [ 'version' => $this->claude_huella( $raw ), 'elemento' => $el ];
     }
 
-    /** GET /elementor/kit: colores, tipografías y puntos de interrupción del Kit activo. */
-    public function claude_kit() {
+    // ── Kit de Elementor (lectura ampliada y escritura, 1.5.7) ──
+    // Colores y tipografías globales y lo básico del Estilo del tema. Se
+    // guarda con el save() del Kit, como el botón Guardar de los Ajustes del
+    // sitio de Elementor, que además rehace el CSS de toda la web. Ese save()
+    // SUSTITUYE todos los ajustes del documento por los que recibe: siempre
+    // se le mandan los que ya había más los cambios. Antes de cada guardado
+    // queda una copia de cómo estaba el Kit, que se puede restaurar.
+
+    const KIT_META   = '_elementor_page_settings';
+    const KIT_COPIAS = 'caracool_onestep_kit_copias';
+    const KIT_LISTAS = [ 'system_colors', 'custom_colors', 'system_typography', 'custom_typography' ];
+
+    /** Lo que no se cambia con «ajustes»: o tiene su propio campo, o lo decide la persona. */
+    const KIT_BLOQUEADOS = [
+        'system_colors'     => 'los colores van en «colores».',
+        'custom_colors'     => 'los colores van en «colores».',
+        'system_typography' => 'las tipografías van en «tipografias».',
+        'custom_typography' => 'las tipografías van en «tipografias».',
+        '__globals__'       => 'los enlaces a globales van en «estilo» o en «globales».',
+        'custom_css'        => 'en las webs de la casa no se escribe CSS personalizado.',
+        'site_name'         => 'el nombre de la web se cambia en los ajustes de WordPress.',
+        'site_description'  => 'la descripción de la web se cambia en los ajustes de WordPress.',
+        'site_logo'         => 'el logotipo lo cambia la persona en los Ajustes del sitio.',
+        'site_favicon'      => 'el icono de la web lo cambia la persona en los Ajustes del sitio.',
+        'id' => 'no es un ajuste del Kit.', 'post_title' => 'no es un ajuste del Kit.', 'post_status' => 'no es un ajuste del Kit.',
+        'template' => 'no es un ajuste del Kit.', 'post_excerpt' => 'no es un ajuste del Kit.', 'post_featured_image' => 'no es un ajuste del Kit.',
+        'menu_order' => 'no es un ajuste del Kit.', 'comment_status' => 'no es un ajuste del Kit.',
+    ];
+
+    /** Campos de una tipografía: nombre corto => [ control de Elementor, unidad por defecto ]. */
+    const KIT_MEDIDAS = [
+        'tamano'       => [ 'typography_font_size', 'px' ],
+        'interlineado' => [ 'typography_line_height', 'em' ],
+        'espaciado'    => [ 'typography_letter_spacing', 'px' ],
+    ];
+    const KIT_TEXTOS = [
+        'transformacion' => [ 'typography_text_transform', [ 'none', 'uppercase', 'lowercase', 'capitalize' ] ],
+        'estilo'         => [ 'typography_font_style', [ 'normal', 'italic', 'oblique' ] ],
+        'decoracion'     => [ 'typography_text_decoration', [ 'none', 'underline', 'overline', 'line-through' ] ],
+    ];
+
+    /**
+     * Estilo del tema: nombre corto => [ control de Elementor, tipo, extra ].
+     * Los de tipo «color» y «tipo» se enlazan a un global por su id; en un
+     * fondo, el extra es el interruptor que Elementor necesita en «classic».
+     */
+    private static function claude_kit_estilo_mapa() {
+        $m = [
+            'fondo'        => [ 'body_background_color', 'color', 'body_background_background' ],
+            'texto'        => [ 'body_color', 'color' ],
+            'tipografia'   => [ 'body_typography_typography', 'tipo' ],
+            'enlace'       => [ 'link_normal_color', 'color' ],
+            'enlace_hover' => [ 'link_hover_color', 'color' ],
+        ];
+        for ( $i = 1; $i <= 6; $i++ ) {
+            $m[ "h{$i}_color" ]      = [ "h{$i}_color", 'color' ];
+            $m[ "h{$i}_tipografia" ] = [ "h{$i}_typography_typography", 'tipo' ];
+        }
+        return $m + [
+            'boton_texto'             => [ 'button_text_color', 'color' ],
+            'boton_fondo'             => [ 'button_background_color', 'color', 'button_background_background' ],
+            'boton_tipografia'        => [ 'button_typography_typography', 'tipo' ],
+            'boton_hover_texto'       => [ 'button_hover_text_color', 'color' ],
+            'boton_hover_fondo'       => [ 'button_hover_background_color', 'color', 'button_hover_background_background' ],
+            'boton_borde'             => [ 'button_border_border', 'lista', [ 'none', 'solid', 'double', 'dotted', 'dashed', 'groove' ] ],
+            'boton_borde_ancho'       => [ 'button_border_width', 'lados' ],
+            'boton_borde_color'       => [ 'button_border_color', 'color' ],
+            'boton_hover_borde_color' => [ 'button_hover_border_color', 'color' ],
+            'boton_radio'             => [ 'button_border_radius', 'lados' ],
+            'boton_relleno'           => [ 'button_padding', 'lados' ],
+        ];
+    }
+
+    /** El Kit y los ajustes de Motion cambian toda la web: solo un Administrador. */
+    private function claude_puede_diseno() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new \WP_Error( 'co_sin_diseno', 'El Kit de Elementor y los ajustes de Motion cambian toda la web: solo los toca un Administrador.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    /** El Kit activo, o el WP_Error que toque. */
+    private function claude_kit_activo() {
         if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
-
         $km  = \Elementor\Plugin::$instance->kits_manager;
-        $kit = method_exists( $km, 'get_active_kit_for_frontend' ) ? $km->get_active_kit_for_frontend() : $km->get_active_kit();
-        if ( ! $kit ) return new \WP_Error( 'co_sin_kit', 'No hay Kit activo.', [ 'status' => 404 ] );
+        $kit = method_exists( $km, 'get_active_kit' ) ? $km->get_active_kit() : $km->get_active_kit_for_frontend();
+        if ( ! $kit || ! $kit->get_id() ) return new \WP_Error( 'co_sin_kit', 'No hay Kit activo.', [ 'status' => 404 ] );
+        return $kit;
+    }
 
+    /** Los ajustes del Kit tal como están guardados (sin los valores por defecto de Elementor). */
+    private function claude_kit_crudo( $kit_id ) {
+        $m = get_post_meta( $kit_id, self::KIT_META, true );
+        return is_array( $m ) ? $m : [];
+    }
+
+    private static function claude_kit_huella( array $crudo ) {
+        return substr( md5( (string) wp_json_encode( $crudo ) ), 0, 16 );
+    }
+
+    /** Una lista de globales: la guardada o, si el Kit sigue como vino, la de fábrica. */
+    private function claude_kit_lista( $kit, array $crudo, $clave ) {
+        if ( isset( $crudo[ $clave ] ) && is_array( $crudo[ $clave ] ) ) return array_values( $crudo[ $clave ] );
         $s = (array) $kit->get_settings();
+        return array_values( (array) ( $s[ $clave ] ?? [] ) );
+    }
+
+    /** "18px", "0.9em" o una fórmula; '' si no hay nada. */
+    private static function claude_kit_medida_texto( $m ) {
+        if ( ! is_array( $m ) || ! isset( $m['size'] ) || '' === $m['size'] ) return '';
+        if ( 'custom' === ( $m['unit'] ?? '' ) || ! is_numeric( $m['size'] ) ) return (string) $m['size'];
+        return ( 0 + $m['size'] ) . ( $m['unit'] ?? 'px' );
+    }
+
+    /** id de un enlace «globals/colors?id=x», o ''. */
+    private static function claude_kit_id_global( $enlace ) {
+        return preg_match( '/[?&]id=([A-Za-z0-9_-]+)/', (string) $enlace, $m ) ? $m[1] : '';
+    }
+
+    /** Foto legible del Kit: colores, tipografías y Estilo del tema, por id. */
+    private function claude_kit_foto( $kit, array $crudo ) {
         $colores = [];
-        foreach ( array_merge( (array) ( $s['system_colors'] ?? [] ), (array) ( $s['custom_colors'] ?? [] ) ) as $c ) {
-            $colores[] = [ 'id' => $c['_id'] ?? '', 'nombre' => $c['title'] ?? '', 'color' => $c['color'] ?? '' ];
+        foreach ( [ 'system_colors' => true, 'custom_colors' => false ] as $l => $sistema ) {
+            foreach ( $this->claude_kit_lista( $kit, $crudo, $l ) as $c ) {
+                $id = (string) ( $c['_id'] ?? '' );
+                if ( '' === $id ) continue;
+                $colores[ $id ] = [ 'id' => $id, 'nombre' => (string) ( $c['title'] ?? '' ), 'color' => (string) ( $c['color'] ?? '' ), 'sistema' => $sistema ];
+            }
         }
         $tipos = [];
-        foreach ( array_merge( (array) ( $s['system_typography'] ?? [] ), (array) ( $s['custom_typography'] ?? [] ) ) as $t ) {
-            $tipos[] = [
-                'id'     => $t['_id'] ?? '',
-                'nombre' => $t['title'] ?? '',
-                'fuente' => $t['typography_font_family'] ?? '',
-                'peso'   => $t['typography_font_weight'] ?? '',
-            ];
+        foreach ( [ 'system_typography' => true, 'custom_typography' => false ] as $l => $sistema ) {
+            foreach ( $this->claude_kit_lista( $kit, $crudo, $l ) as $t ) {
+                $id = (string) ( $t['_id'] ?? '' );
+                if ( '' === $id ) continue;
+                $o = [
+                    'id'      => $id,
+                    'nombre'  => (string) ( $t['title'] ?? '' ),
+                    'fuente'  => (string) ( $t['typography_font_family'] ?? '' ),
+                    'peso'    => (string) ( $t['typography_font_weight'] ?? '' ),
+                    'sistema' => $sistema,
+                ];
+                foreach ( self::KIT_MEDIDAS as $corto => $def ) {
+                    foreach ( [ '' => '', '_tablet' => '_tablet', '_movil' => '_mobile' ] as $suf => $sufijo ) {
+                        $txt = self::claude_kit_medida_texto( $t[ $def[0] . $sufijo ] ?? null );
+                        if ( '' !== $txt ) $o[ $corto . $suf ] = $txt;
+                    }
+                }
+                foreach ( self::KIT_TEXTOS as $corto => $def ) {
+                    if ( ! empty( $t[ $def[0] ] ) ) $o[ $corto ] = (string) $t[ $def[0] ];
+                }
+                $tipos[ $id ] = $o;
+            }
         }
+        $estilo  = [];
+        $globales = (array) ( $crudo['__globals__'] ?? [] );
+        foreach ( self::claude_kit_estilo_mapa() as $corto => $def ) {
+            $control = $def[0];
+            if ( 'color' === $def[1] || 'tipo' === $def[1] ) {
+                $id = self::claude_kit_id_global( $globales[ $control ] ?? '' );
+                if ( '' !== $id ) $estilo[ $corto ] = $id;
+                elseif ( isset( $crudo[ $control ] ) && '' !== $crudo[ $control ] ) $estilo[ $corto ] = [ 'escrito_a_mano' => $crudo[ $control ] ];
+            } elseif ( 'lados' === $def[1] ) {
+                $v = $crudo[ $control ] ?? null;
+                if ( is_array( $v ) && isset( $v['top'] ) && '' !== $v['top'] ) {
+                    $u = (string) ( $v['unit'] ?? 'px' );
+                    $estilo[ $corto ] = implode( ' ', array_map( function ( $l ) use ( $v, $u ) { return ( is_numeric( $v[ $l ] ?? '' ) ? 0 + $v[ $l ] : 0 ) . $u; }, [ 'top', 'right', 'bottom', 'left' ] ) );
+                }
+            } elseif ( isset( $crudo[ $control ] ) && '' !== $crudo[ $control ] ) {
+                $estilo[ $corto ] = $crudo[ $control ];
+            }
+        }
+        return [ 'colores' => $colores, 'tipografias' => $tipos, 'estilo' => $estilo ];
+    }
+
+    /** GET /elementor/kit: colores, tipografías, Estilo del tema, puntos de interrupción y la «version» para guardar. */
+    public function claude_kit() {
+        $kit = $this->claude_kit_activo();
+        if ( is_wp_error( $kit ) ) return $kit;
+
+        $crudo = $this->claude_kit_crudo( (int) $kit->get_id() );
+        $foto  = $this->claude_kit_foto( $kit, $crudo );
+        $s     = (array) $kit->get_settings();
         return [
             'kit'         => $kit->get_id(),
-            'colores'     => $colores,
-            'tipografias' => $tipos,
+            'version'     => self::claude_kit_huella( $crudo ),
+            'colores'     => array_values( $foto['colores'] ),
+            'tipografias' => array_values( $foto['tipografias'] ),
+            'estilo'      => (object) $foto['estilo'],
+            'estilo_claves' => array_keys( self::claude_kit_estilo_mapa() ),
             'puntos'      => $s['active_breakpoints'] ?? null,
             'como_enlazar'=> 'En __globals__ de un elemento: "globals/colors?id=<id>" y, para tipografía, la clave typography_typography con "globals/typography?id=<id>".',
         ];
+    }
+
+    // Entradas del guardado del Kit. Un valor que no vale lanza
+    // InvalidArgumentException con la frase que se devuelve en el 400.
+
+    private static function claude_kit_color( $v ) {
+        $v = is_scalar( $v ) ? trim( (string) $v ) : '';
+        if ( ! preg_match( '/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i', $v ) ) {
+            throw new \InvalidArgumentException( 'Un color va en hexadecimal: #RGB, #RRGGBB o #RRGGBBAA.' );
+        }
+        return strtoupper( $v );
+    }
+
+    /** Medida de Elementor ({unit, size, sizes}) a partir de 18, "18px", "0.9em" o una fórmula clamp(). */
+    private static function claude_kit_medida( $v, $unidad, $campo ) {
+        if ( is_array( $v ) ) $v = ( $v['valor'] ?? $v['size'] ?? '' ) . ( $v['unidad'] ?? $v['unit'] ?? '' );
+        $v = is_scalar( $v ) ? trim( (string) $v ) : '';
+        // Una fórmula se guarda tal cual, con sus comas.
+        if ( preg_match( '/^(clamp|min|max|calc)\([0-9a-z.%+*\/\s(),-]+\)$/i', $v ) ) {
+            return [ 'unit' => 'custom', 'size' => $v, 'sizes' => [] ];
+        }
+        $v = str_replace( ',', '.', $v );
+        if ( ! preg_match( '/^(-?\d+(?:\.\d+)?)\s*(px|em|rem|vw|vh|%)?$/i', $v, $m ) ) {
+            throw new \InvalidArgumentException( '«' . $campo . '»: una medida es un número con su unidad (18px, 0.9em, 6.4vw) o una fórmula clamp().' );
+        }
+        return [ 'unit' => isset( $m[2] ) && '' !== $m[2] ? strtolower( $m[2] ) : $unidad, 'size' => 0 + $m[1], 'sizes' => [] ];
+    }
+
+    /** Los cuatro lados de Elementor a partir de 12, "12px 24px" o {top, right, bottom, left, unit}. */
+    private static function claude_kit_lados( $v, $campo ) {
+        if ( is_array( $v ) ) {
+            $u = (string) ( $v['unit'] ?? $v['unidad'] ?? 'px' );
+            $v = implode( ' ', array_map( function ( $l ) use ( $v, $u ) { return ( $v[ $l ] ?? 0 ) . $u; }, [ 'top', 'right', 'bottom', 'left' ] ) );
+        }
+        $partes = preg_split( '/\s+/', trim( str_replace( ',', '.', (string) $v ) ) );
+        if ( ! $partes || count( $partes ) > 4 ) throw new \InvalidArgumentException( '«' . $campo . '»: de uno a cuatro valores, como en CSS (12px, o 12px 24px).' );
+        $nums = []; $unidad = '';
+        foreach ( $partes as $p ) {
+            if ( ! preg_match( '/^(\d+(?:\.\d+)?)(px|em|rem|%|vw)?$/i', $p, $m ) ) throw new \InvalidArgumentException( '«' . $campo . '»: «' . $p . '» no es una medida (12px, 1em, 50%).' );
+            $u = isset( $m[2] ) && '' !== $m[2] ? strtolower( $m[2] ) : 'px';
+            if ( '' !== $unidad && $u !== $unidad && 0.0 !== (float) $m[1] ) throw new \InvalidArgumentException( '«' . $campo . '»: los cuatro lados van en la misma unidad.' );
+            if ( 0.0 !== (float) $m[1] || '' === $unidad ) $unidad = $u;
+            $nums[] = (string) ( 0 + $m[1] );
+        }
+        $n = count( $nums );
+        $t = $nums[0]; $r = $nums[1] ?? $t; $b = $n > 2 ? $nums[2] : $t; $l = $n > 3 ? $nums[3] : $r;
+        return [ 'unit' => $unidad, 'top' => $t, 'right' => $r, 'bottom' => $b, 'left' => $l, 'isLinked' => $t === $r && $r === $b && $b === $l ];
+    }
+
+    /** [ lista, índice ] del global con ese id, o null. */
+    private static function claude_kit_buscar( array $listas, array $en, $id ) {
+        if ( '' === $id ) return null;
+        foreach ( $en as $l ) {
+            foreach ( $listas[ $l ] as $i => $x ) {
+                if ( (string) ( $x['_id'] ?? '' ) === $id ) return [ $l, $i ];
+            }
+        }
+        return null;
+    }
+
+    /** El id de un global nuevo: el que se pide, si vale, o uno al azar como los de Elementor. */
+    private static function claude_kit_id_nuevo( $id, array $listas, array $en ) {
+        if ( '' !== $id ) {
+            if ( ! preg_match( '/^[a-z0-9][a-z0-9_-]{1,23}$/', $id ) ) {
+                throw new \InvalidArgumentException( 'El id «' . $id . '» no vale: de 2 a 24 caracteres, en minúsculas, con letras, números, - o _.' );
+            }
+            return $id;
+        }
+        do {
+            $id = substr( md5( uniqid( '', true ) ), 0, 7 );
+        } while ( self::claude_kit_buscar( $listas, $en, $id ) );
+        return $id;
+    }
+
+    /** Aplica lo pedido sobre los ajustes guardados y devuelve los nuevos, sin guardar nada. */
+    private function claude_kit_aplicar( $kit, array $crudo, array $p, array &$avisos ) {
+        $nuevo  = $crudo;
+        $listas = [];
+        foreach ( self::KIT_LISTAS as $l ) $listas[ $l ] = $this->claude_kit_lista( $kit, $crudo, $l );
+
+        if ( array_key_exists( 'colores', $p ) ) {
+            if ( ! is_array( $p['colores'] ) ) throw new \InvalidArgumentException( '«colores» es una lista de {id, nombre, color}.' );
+            $en = [ 'system_colors', 'custom_colors' ];
+            foreach ( $p['colores'] as $c ) {
+                if ( ! is_array( $c ) ) throw new \InvalidArgumentException( 'Cada color es un objeto {id, nombre, color}.' );
+                $id     = isset( $c['id'] ) && is_scalar( $c['id'] ) ? (string) $c['id'] : '';
+                $color  = array_key_exists( 'color', $c ) ? self::claude_kit_color( $c['color'] ) : null;
+                $nombre = isset( $c['nombre'] ) && is_scalar( $c['nombre'] ) ? sanitize_text_field( (string) $c['nombre'] ) : '';
+                $donde  = self::claude_kit_buscar( $listas, $en, $id );
+                if ( $donde ) {
+                    if ( null !== $color ) $listas[ $donde[0] ][ $donde[1] ]['color'] = $color;
+                    if ( '' !== $nombre ) $listas[ $donde[0] ][ $donde[1] ]['title'] = $nombre;
+                    continue;
+                }
+                if ( null === $color || '' === $nombre ) {
+                    throw new \InvalidArgumentException( ( '' !== $id ? 'No hay ningún color con el id «' . $id . '». ' : '' ) . 'Un color nuevo necesita «nombre» y «color».' );
+                }
+                $listas['custom_colors'][] = [ '_id' => self::claude_kit_id_nuevo( $id, $listas, $en ), 'title' => $nombre, 'color' => $color ];
+            }
+            $nuevo['system_colors'] = $listas['system_colors'];
+            $nuevo['custom_colors'] = $listas['custom_colors'];
+        }
+
+        if ( array_key_exists( 'tipografias', $p ) ) {
+            if ( ! is_array( $p['tipografias'] ) ) throw new \InvalidArgumentException( '«tipografias» es una lista de {id, nombre, fuente, peso, tamano…}.' );
+            $en = [ 'system_typography', 'custom_typography' ];
+            foreach ( $p['tipografias'] as $t ) {
+                if ( ! is_array( $t ) ) throw new \InvalidArgumentException( 'Cada tipografía es un objeto {id, nombre, fuente, peso, tamano…}.' );
+                $id    = isset( $t['id'] ) && is_scalar( $t['id'] ) ? (string) $t['id'] : '';
+                $donde = self::claude_kit_buscar( $listas, $en, $id );
+                $item  = $donde ? $listas[ $donde[0] ][ $donde[1] ] : [ 'title' => '' ];
+                if ( isset( $t['nombre'] ) && is_scalar( $t['nombre'] ) && '' !== trim( (string) $t['nombre'] ) ) $item['title'] = sanitize_text_field( (string) $t['nombre'] );
+                if ( array_key_exists( 'fuente', $t ) ) {
+                    $f = is_scalar( $t['fuente'] ) ? sanitize_text_field( (string) $t['fuente'] ) : '';
+                    if ( '' === $f || strlen( $f ) > 80 ) throw new \InvalidArgumentException( '«fuente» es el nombre de la familia (Syne, DM Sans…).' );
+                    $item['typography_font_family'] = $f;
+                }
+                if ( array_key_exists( 'peso', $t ) ) {
+                    $w = is_scalar( $t['peso'] ) ? (string) $t['peso'] : '';
+                    if ( ! in_array( $w, [ '100', '200', '300', '400', '500', '600', '700', '800', '900', 'normal', 'bold' ], true ) ) {
+                        throw new \InvalidArgumentException( '«peso» va de 100 a 900 de cien en cien, o normal o bold.' );
+                    }
+                    $item['typography_font_weight'] = $w;
+                }
+                foreach ( self::KIT_MEDIDAS as $corto => $def ) {
+                    foreach ( [ '' => '', '_tablet' => '_tablet', '_movil' => '_mobile' ] as $suf => $sufijo ) {
+                        if ( ! array_key_exists( $corto . $suf, $t ) ) continue;
+                        if ( null === $t[ $corto . $suf ] || '' === $t[ $corto . $suf ] ) unset( $item[ $def[0] . $sufijo ] );
+                        else $item[ $def[0] . $sufijo ] = self::claude_kit_medida( $t[ $corto . $suf ], $def[1], $corto . $suf );
+                    }
+                }
+                foreach ( self::KIT_TEXTOS as $corto => $def ) {
+                    if ( ! array_key_exists( $corto, $t ) ) continue;
+                    if ( null === $t[ $corto ] || '' === $t[ $corto ] ) { unset( $item[ $def[0] ] ); continue; }
+                    if ( ! in_array( $t[ $corto ], $def[1], true ) ) throw new \InvalidArgumentException( '«' . $corto . '» vale ' . implode( ', ', $def[1] ) . '.' );
+                    $item[ $def[0] ] = $t[ $corto ];
+                }
+                $item['typography_typography'] = 'custom';
+                if ( $donde ) {
+                    $listas[ $donde[0] ][ $donde[1] ] = $item;
+                    continue;
+                }
+                if ( '' === $item['title'] || empty( $item['typography_font_family'] ) ) {
+                    throw new \InvalidArgumentException( ( '' !== $id ? 'No hay ninguna tipografía con el id «' . $id . '». ' : '' ) . 'Una tipografía nueva necesita «nombre» y «fuente».' );
+                }
+                $listas['custom_typography'][] = [ '_id' => self::claude_kit_id_nuevo( $id, $listas, $en ) ] + $item;
+            }
+            $nuevo['system_typography'] = $listas['system_typography'];
+            $nuevo['custom_typography'] = $listas['custom_typography'];
+        }
+
+        $ids = [ 'color' => [], 'tipo' => [] ];
+        foreach ( [ 'system_colors' => 'color', 'custom_colors' => 'color', 'system_typography' => 'tipo', 'custom_typography' => 'tipo' ] as $l => $que ) {
+            foreach ( $listas[ $l ] as $x ) $ids[ $que ][] = (string) ( $x['_id'] ?? '' );
+        }
+        $ruta = [ 'color' => 'globals/colors?id=', 'tipo' => 'globals/typography?id=' ];
+
+        if ( array_key_exists( 'estilo', $p ) ) {
+            if ( ! is_array( $p['estilo'] ) ) throw new \InvalidArgumentException( '«estilo» es {clave: valor}; las claves las da la lectura del Kit en «estilo_claves».' );
+            $mapa = self::claude_kit_estilo_mapa();
+            foreach ( $p['estilo'] as $k => $val ) {
+                if ( ! isset( $mapa[ $k ] ) ) throw new \InvalidArgumentException( '«' . $k . '» no está en el Estilo del tema que se cambia por aquí. Hay: ' . implode( ', ', array_keys( $mapa ) ) . '.' );
+                $control = $mapa[ $k ][0];
+                $tipo    = $mapa[ $k ][1];
+                if ( null === $val || '' === $val ) {
+                    unset( $nuevo[ $control ], $nuevo['__globals__'][ $control ] );
+                    continue;
+                }
+                if ( 'color' === $tipo || 'tipo' === $tipo ) {
+                    if ( ! is_string( $val ) || ! in_array( $val, $ids[ $tipo ], true ) ) {
+                        throw new \InvalidArgumentException( '«' . $k . '» se enlaza a un global por su id (' . implode( ', ', $ids[ $tipo ] ) . '), no con un valor escrito a mano.' );
+                    }
+                    $nuevo['__globals__'][ $control ] = $ruta[ $tipo ] . $val;
+                    unset( $nuevo[ $control ] );
+                    if ( ! empty( $mapa[ $k ][2] ) ) $nuevo[ $mapa[ $k ][2] ] = 'classic';
+                } elseif ( 'lista' === $tipo ) {
+                    if ( ! in_array( $val, $mapa[ $k ][2], true ) ) throw new \InvalidArgumentException( '«' . $k . '» vale ' . implode( ', ', $mapa[ $k ][2] ) . '.' );
+                    $nuevo[ $control ] = $val;
+                } else {
+                    $nuevo[ $control ] = self::claude_kit_lados( $val, $k );
+                }
+            }
+            $borde = $nuevo['button_border_border'] ?? '';
+            if ( ( isset( $nuevo['__globals__']['button_border_color'] ) || isset( $nuevo['button_border_width'] ) ) && ( '' === $borde || 'none' === $borde ) ) {
+                $avisos[] = 'El botón tiene color o ancho de borde pero no tipo de borde: sin «boton_borde» (solid…) no se pinta.';
+            }
+        }
+
+        if ( array_key_exists( 'ajustes', $p ) ) {
+            if ( ! is_array( $p['ajustes'] ) ) throw new \InvalidArgumentException( '«ajustes» es {control de Elementor: valor}.' );
+            foreach ( $p['ajustes'] as $k => $val ) {
+                if ( ! is_string( $k ) || ! preg_match( '/^[a-z0-9_]+$/', $k ) ) throw new \InvalidArgumentException( 'En «ajustes», «' . $k . '» no es el nombre de un control de Elementor.' );
+                if ( isset( self::KIT_BLOQUEADOS[ $k ] ) ) throw new \InvalidArgumentException( '«' . $k . '» no se cambia en «ajustes»: ' . self::KIT_BLOQUEADOS[ $k ] );
+                if ( null === $val ) unset( $nuevo[ $k ] );
+                else $nuevo[ $k ] = $val;
+                if ( is_string( $val ) && preg_match( '/^#[0-9a-f]{3,8}$/i', $val ) ) $avisos[] = '«' . $k . '» lleva un color escrito a mano: mejor enlazarlo a un global en «globales».';
+            }
+        }
+
+        if ( array_key_exists( 'globales', $p ) ) {
+            if ( ! is_array( $p['globales'] ) ) throw new \InvalidArgumentException( '«globales» es {control de Elementor: id del global}.' );
+            foreach ( $p['globales'] as $k => $val ) {
+                if ( ! is_string( $k ) || ! preg_match( '/^[a-z0-9_]+$/', $k ) || isset( self::KIT_BLOQUEADOS[ $k ] ) ) throw new \InvalidArgumentException( 'En «globales», «' . $k . '» no es un control que se pueda enlazar.' );
+                if ( null === $val || '' === $val ) { unset( $nuevo['__globals__'][ $k ] ); continue; }
+                $que = '_typography' === substr( $k, -11 ) ? 'tipo' : 'color';
+                $id  = is_string( $val ) ? ( self::claude_kit_id_global( $val ) ?: $val ) : '';
+                if ( ! in_array( $id, $ids[ $que ], true ) ) throw new \InvalidArgumentException( 'En «globales», «' . $k . '» pide el id de ' . ( 'tipo' === $que ? 'una tipografía' : 'un color' ) . ' global (' . implode( ', ', $ids[ $que ] ) . ').' );
+                $nuevo['__globals__'][ $k ] = $ruta[ $que ] . $id;
+                unset( $nuevo[ $k ] );
+            }
+        }
+
+        if ( isset( $nuevo['__globals__'] ) && ! $nuevo['__globals__'] ) unset( $nuevo['__globals__'] );
+        return $nuevo;
+    }
+
+    /** Lo que cambia entre dos estados del Kit, por id y por clave. */
+    private function claude_kit_diferencias( $kit, array $antes, array $despues ) {
+        $a = $this->claude_kit_foto( $kit, $antes );
+        $d = $this->claude_kit_foto( $kit, $despues );
+        $cambios = [];
+        foreach ( [ 'colores', 'tipografias', 'estilo' ] as $parte ) {
+            foreach ( array_unique( array_merge( array_keys( $a[ $parte ] ), array_keys( $d[ $parte ] ) ) ) as $k ) {
+                $x = $a[ $parte ][ $k ] ?? null;
+                $y = $d[ $parte ][ $k ] ?? null;
+                if ( wp_json_encode( $x ) !== wp_json_encode( $y ) ) $cambios[ $parte ][ $k ] = [ 'antes' => $x, 'despues' => $y ];
+            }
+        }
+        // Lo demás: controles sueltos y enlaces a globales que no salen en «estilo».
+        $de_estilo = [];
+        foreach ( self::claude_kit_estilo_mapa() as $def ) {
+            $de_estilo[ $def[0] ] = true;
+            if ( ! empty( $def[2] ) && is_string( $def[2] ) ) $de_estilo[ $def[2] ] = true;
+        }
+        $aparte = array_flip( self::KIT_LISTAS ) + [ '__globals__' => 1 ] + $de_estilo;
+        foreach ( array_unique( array_merge( array_keys( $antes ), array_keys( $despues ) ) ) as $k ) {
+            if ( isset( $aparte[ $k ] ) ) continue;
+            $x = $antes[ $k ] ?? null;
+            $y = $despues[ $k ] ?? null;
+            if ( wp_json_encode( $x ) !== wp_json_encode( $y ) ) $cambios['ajustes'][ $k ] = [ 'antes' => $x, 'despues' => $y ];
+        }
+        $ga = (array) ( $antes['__globals__'] ?? [] );
+        $gd = (array) ( $despues['__globals__'] ?? [] );
+        foreach ( array_unique( array_merge( array_keys( $ga ), array_keys( $gd ) ) ) as $k ) {
+            if ( isset( $de_estilo[ $k ] ) ) continue;
+            if ( ( $ga[ $k ] ?? null ) !== ( $gd[ $k ] ?? null ) ) $cambios['globales'][ $k ] = [ 'antes' => $ga[ $k ] ?? null, 'despues' => $gd[ $k ] ?? null ];
+        }
+        return $cambios;
+    }
+
+    /** Comprobaciones de cualquier escritura del Kit. Devuelve [ kit, crudo ] o el WP_Error que toque. */
+    private function claude_kit_comprobar( array $p ) {
+        $ok = $this->claude_puede_diseno();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $kit = $this->claude_kit_activo();
+        if ( is_wp_error( $kit ) ) return $kit;
+
+        $crudo = $this->claude_kit_crudo( (int) $kit->get_id() );
+        $v     = (string) ( $p['version'] ?? '' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» del Kit (la da GET /elementor/kit).', [ 'status' => 428 ] );
+        if ( ! hash_equals( self::claude_kit_huella( $crudo ), $v ) ) {
+            return new \WP_Error( 'co_cambiada', 'El Kit ha cambiado desde que se leyó (alguien ha guardado los Ajustes del sitio). Vuelve a leerlo.', [ 'status' => 409 ] );
+        }
+        return [ $kit, $crudo ];
+    }
+
+    /** Guarda los ajustes del Kit dejando antes una copia de cómo estaba. Devuelve true o WP_Error. */
+    private function claude_kit_escribir( $kit, array $crudo, array $nuevo, array $p ) {
+        $kit_id = (int) $kit->get_id();
+        $lock   = $this->claude_bloqueo( $kit_id );
+        if ( $lock && empty( $p['forzar'] ) ) {
+            return new \WP_Error( 'co_bloqueada', sprintf( '%s tiene abiertos los Ajustes del sitio en el editor ahora mismo. Espera a que los cierre.', $lock->display_name ), [ 'status' => 423 ] );
+        }
+        if ( method_exists( $kit, 'is_editable_by_current_user' ) && ! $kit->is_editable_by_current_user() ) {
+            return new \WP_Error( 'co_permiso', 'Elementor no deja editar el Kit al usuario de Claude.', [ 'status' => 403 ] );
+        }
+
+        $copias = (array) get_option( self::KIT_COPIAS, [] );
+        array_unshift( $copias, [
+            'fecha'   => current_time( 'mysql' ),
+            'usuario' => wp_get_current_user()->user_login,
+            'kit'     => $kit_id,
+            'ajustes' => $crudo,
+        ] );
+        update_option( self::KIT_COPIAS, array_slice( $copias, 0, 10 ), false );
+        $this->claude_crear_revision( $kit_id );
+
+        try {
+            if ( $nuevo ) {
+                $ok = $kit->save( [ 'settings' => $nuevo ] );
+            } else {
+                // Volver a un Kit sin nada guardado: save() no hace nada con ajustes vacíos.
+                delete_post_meta( $kit_id, self::KIT_META );
+                $ok = true;
+            }
+        } catch ( \Throwable $e ) {
+            return new \WP_Error( 'co_guardar', 'Elementor ha dado un error al guardar el Kit: ' . $e->getMessage(), [ 'status' => 500 ] );
+        }
+        if ( ! $ok ) return new \WP_Error( 'co_guardar', 'Elementor no ha guardado el Kit.', [ 'status' => 500 ] );
+
+        wp_cache_delete( $kit_id, 'post_meta' );
+        try {
+            \Elementor\Plugin::$instance->files_manager->clear_cache();
+        } catch ( \Throwable $e ) {
+            // El save() del Kit ya lo hace; si aquí falla, el CSS se rehace en la primera visita.
+        }
+        return true;
+    }
+
+    /**
+     * POST /elementor/kit {version, colores?, tipografias?, estilo?, ajustes?, globales?, probar?, forzar?}.
+     * Se comprueba todo antes de guardar nada.
+     */
+    public function claude_kit_guardar( \WP_REST_Request $request ) {
+        $p   = (array) $request->get_json_params();
+        $pre = $this->claude_kit_comprobar( $p );
+        if ( is_wp_error( $pre ) ) return $pre;
+        list( $kit, $crudo ) = $pre;
+
+        $avisos = [];
+        try {
+            $nuevo = $this->claude_kit_aplicar( $kit, $crudo, $p, $avisos );
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_kit', $e->getMessage(), [ 'status' => 400 ] );
+        }
+        $cambios   = $this->claude_kit_diferencias( $kit, $crudo, $nuevo );
+        $respuesta = [ 'cambios' => (object) $cambios, 'avisos' => $avisos ];
+        if ( ! empty( $p['probar'] ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => self::claude_kit_huella( $crudo ) ];
+        }
+
+        $ok = $this->claude_kit_escribir( $kit, $crudo, $nuevo, $p );
+        if ( is_wp_error( $ok ) ) return $ok;
+
+        $partes = [];
+        foreach ( $cambios as $parte => $lista ) $partes[] = $parte . ': ' . implode( ', ', array_keys( $lista ) );
+        $this->claude_registrar( 'kit', (int) $kit->get_id(), implode( ' · ', $partes ) );
+
+        $ahora = $this->claude_kit_crudo( (int) $kit->get_id() );
+        $foto  = $this->claude_kit_foto( $kit, $ahora );
+        return $respuesta + [
+            'guardado'    => true,
+            'version'     => self::claude_kit_huella( $ahora ),
+            'copia'       => 0,
+            'colores'     => array_values( $foto['colores'] ),
+            'tipografias' => array_values( $foto['tipografias'] ),
+            'estilo'      => (object) $foto['estilo'],
+        ];
+    }
+
+    /** GET /elementor/kit/copias: las copias que quedan de antes de cada guardado (la 0 es la más reciente). */
+    public function claude_kit_copias() {
+        $ok = $this->claude_puede_diseno();
+        if ( is_wp_error( $ok ) ) return $ok;
+        $out = [];
+        foreach ( array_values( (array) get_option( self::KIT_COPIAS, [] ) ) as $i => $c ) {
+            $aj    = (array) ( $c['ajustes'] ?? [] );
+            $out[] = [
+                'indice'      => $i,
+                'fecha'       => $c['fecha'] ?? '',
+                'usuario'     => $c['usuario'] ?? '',
+                'kit'         => (int) ( $c['kit'] ?? 0 ),
+                'de_fabrica'  => ! $aj,
+                'colores'     => count( (array) ( $aj['system_colors'] ?? [] ) ) + count( (array) ( $aj['custom_colors'] ?? [] ) ),
+                'tipografias' => count( (array) ( $aj['system_typography'] ?? [] ) ) + count( (array) ( $aj['custom_typography'] ?? [] ) ),
+            ];
+        }
+        return $out;
+    }
+
+    /** POST /elementor/kit/copias/{i} {version, probar?, forzar?}: vuelve el Kit a como estaba en esa copia. */
+    public function claude_kit_restaurar( \WP_REST_Request $request ) {
+        $p   = (array) $request->get_json_params();
+        $pre = $this->claude_kit_comprobar( $p );
+        if ( is_wp_error( $pre ) ) return $pre;
+        list( $kit, $crudo ) = $pre;
+
+        $copias = array_values( (array) get_option( self::KIT_COPIAS, [] ) );
+        $i      = (int) $request['i'];
+        if ( ! isset( $copias[ $i ] ) ) return new \WP_Error( 'co_no_copia', 'No hay ninguna copia del Kit con ese índice.', [ 'status' => 404 ] );
+        if ( (int) ( $copias[ $i ]['kit'] ?? 0 ) !== (int) $kit->get_id() ) {
+            return new \WP_Error( 'co_otro_kit', 'Esa copia es de otro Kit, no del que está activo ahora.', [ 'status' => 409 ] );
+        }
+        $destino   = (array) ( $copias[ $i ]['ajustes'] ?? [] );
+        $cambios   = $this->claude_kit_diferencias( $kit, $crudo, $destino );
+        $respuesta = [ 'cambios' => (object) $cambios, 'copia_restaurada' => [ 'indice' => $i, 'fecha' => $copias[ $i ]['fecha'] ?? '' ] ];
+        if ( ! empty( $p['probar'] ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => self::claude_kit_huella( $crudo ) ];
+        }
+
+        $ok = $this->claude_kit_escribir( $kit, $crudo, $destino, $p );
+        if ( is_wp_error( $ok ) ) return $ok;
+        $this->claude_registrar( 'kit', (int) $kit->get_id(), 'restaurada la copia del ' . ( $copias[ $i ]['fecha'] ?? '' ) );
+
+        return $respuesta + [ 'guardado' => true, 'version' => self::claude_kit_huella( $this->claude_kit_crudo( (int) $kit->get_id() ) ) ];
+    }
+
+    // ── Ajustes del panel de Caracool Motion (1.5.7) ──────────
+    // OneStep no conoce los ajustes de Motion: los lee con el get_settings()
+    // de cada módulo y, para validar, le pregunta a ese mismo get_settings()
+    // cómo dejaría el valor pedido. Si Motion lo cambiaría (una variante que
+    // no existe, un número fuera de margen), no se guarda y se dice por qué.
+
+    /** Módulos de Motion con ajustes de panel: nombre => clase. */
+    const MOTION_MODULOS = [
+        'botones'  => 'Caracool_Motion_Botones',
+        'cabecera' => 'Caracool_Motion_Cabecera',
+        'intro'    => 'Caracool_Motion_Intro',
+        'scroll'   => 'Caracool_Motion_Scroll',
+        'pie'      => 'Caracool_Motion_Pie',
+        'fondo'    => 'Caracool_Motion_Fondo',
+    ];
+
+    /** Ajustes de Motion que son el id de un color global del Kit. */
+    const MOTION_COLORES = [ 'cabecera' => [ 'fondo', 'linea' ], 'intro' => [ 'fondo' ], 'scroll' => [ 'puntos_color' ] ];
+
+    /** Catálogos que Motion publica: método del módulo => ajuste al que se aplica. */
+    const MOTION_CATALOGOS = [ 'variantes' => 'variante', 'animaciones' => 'animacion', 'salidas' => 'salida' ];
+
+    /** Los módulos de Motion que hay en esta web y se dejan leer. */
+    private function claude_motion_modulos() {
+        $out = [];
+        foreach ( self::MOTION_MODULOS as $nombre => $clase ) {
+            if ( class_exists( $clase ) && method_exists( $clase, 'get_settings' ) && defined( $clase . '::OPTION_KEY' ) ) $out[ $nombre ] = $clase;
+        }
+        return $out;
+    }
+
+    /** Los ajustes de todos los módulos, o un WP_Error si Motion falla al darlos. */
+    private function claude_motion_todo() {
+        $out = [];
+        foreach ( $this->claude_motion_modulos() as $nombre => $clase ) {
+            try {
+                $out[ $nombre ] = (array) call_user_func( [ $clase, 'get_settings' ] );
+            } catch ( \Throwable $e ) {
+                return new \WP_Error( 'co_motion', 'Motion ha dado un error al leer los ajustes de «' . $nombre . '»: ' . $e->getMessage(), [ 'status' => 500 ] );
+            }
+        }
+        return $out;
+    }
+
+    private static function claude_motion_huella( array $todo ) {
+        return substr( md5( (string) wp_json_encode( $todo ) ), 0, 12 );
+    }
+
+    /** Cómo dejaría Motion unos ajustes, sin guardarlos: su propio get_settings() sobre el candidato. */
+    private static function claude_motion_simular( $clase, array $candidato ) {
+        $gancho = 'pre_option_' . constant( $clase . '::OPTION_KEY' );
+        $f      = function () use ( $candidato ) { return $candidato; };
+        add_filter( $gancho, $f );
+        try {
+            return (array) call_user_func( [ $clase, 'get_settings' ] );
+        } finally {
+            // Pase lo que pase en Motion, el filtro no se queda puesto.
+            remove_filter( $gancho, $f );
+        }
+    }
+
+    private static function claude_motion_igual( $a, $b ) {
+        if ( is_array( $a ) || is_array( $b ) ) return array_values( array_map( 'strval', (array) $a ) ) === array_values( array_map( 'strval', (array) $b ) );
+        if ( is_numeric( $a ) && is_numeric( $b ) ) return abs( (float) $a - (float) $b ) < 0.00001;
+        return (string) $a === (string) $b;
+    }
+
+    private function claude_motion_comprobar() {
+        if ( ! $this->claude_hay_motion() ) return new \WP_Error( 'co_sin_motion', 'Esta web no tiene Caracool Motion.', [ 'status' => 404 ] );
+        return $this->claude_puede_diseno();
+    }
+
+    /** GET /motion/ajustes: los ajustes del panel de Caracool → Motion, por módulo, y su «version». */
+    public function claude_motion_ajustes() {
+        $ok = $this->claude_motion_comprobar();
+        if ( is_wp_error( $ok ) ) return $ok;
+
+        $todo = $this->claude_motion_todo();
+        if ( is_wp_error( $todo ) ) return $todo;
+        $modulos = [];
+        foreach ( $this->claude_motion_modulos() as $nombre => $clase ) {
+            $opciones = [];
+            foreach ( self::MOTION_CATALOGOS as $metodo => $ajuste ) {
+                if ( ! isset( $todo[ $nombre ][ $ajuste ] ) || ! method_exists( $clase, $metodo ) ) continue;
+                foreach ( (array) call_user_func( [ $clase, $metodo ] ) as $k => $def ) {
+                    $opciones[ $ajuste ][ $k ] = is_array( $def ) ? (string) ( $def['etiqueta'] ?? $k ) : (string) $def;
+                }
+            }
+            foreach ( (array) ( self::MOTION_COLORES[ $nombre ] ?? [] ) as $ajuste ) {
+                if ( isset( $todo[ $nombre ][ $ajuste ] ) ) $opciones[ $ajuste ] = 'id de un color global del Kit';
+            }
+            $modulos[ $nombre ] = [ 'ajustes' => $todo[ $nombre ], 'opciones' => (object) $opciones ];
+        }
+        return [
+            'motion'  => CARACOOL_MOTION_VERSION,
+            'version' => self::claude_motion_huella( $todo ),
+            'modulos' => $modulos,
+            'nota'    => 'Los interruptores valen «si» o «no» (al guardar también true o false). Lo demás, con el valor tal como sale aquí.',
+        ];
+    }
+
+    /** POST /motion/ajustes {version, modulos:{módulo:{ajuste: valor}}, probar?}. Se comprueba todo antes de guardar nada. */
+    public function claude_motion_ajustes_guardar( \WP_REST_Request $request ) {
+        $ok = $this->claude_motion_comprobar();
+        if ( is_wp_error( $ok ) ) return $ok;
+
+        $p     = (array) $request->get_json_params();
+        $antes = $this->claude_motion_todo();
+        if ( is_wp_error( $antes ) ) return $antes;
+        $v     = (string) ( $p['version'] ?? '' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta la «version» de los ajustes de Motion (la da GET /motion/ajustes).', [ 'status' => 428 ] );
+        if ( ! hash_equals( self::claude_motion_huella( $antes ), $v ) ) return new \WP_Error( 'co_cambiada', 'Los ajustes de Motion han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
+
+        $pedidos = $p['modulos'] ?? null;
+        if ( ! is_array( $pedidos ) || ! $pedidos ) return new \WP_Error( 'co_motion', 'Faltan los «modulos» que cambiar: {módulo: {ajuste: valor}}.', [ 'status' => 400 ] );
+        $mal     = function ( $msg ) { return new \WP_Error( 'co_motion', $msg, [ 'status' => 400 ] ); };
+        $clases  = $this->claude_motion_modulos();
+        $colores = null;
+
+        $nuevos  = [];
+        $cambios = [];
+        foreach ( $pedidos as $nombre => $ajustes ) {
+            if ( ! isset( $clases[ $nombre ] ) ) return $mal( '«' . $nombre . '» no es un módulo de Motion en esta web. Hay: ' . implode( ', ', array_keys( $clases ) ) . '.' );
+            if ( ! is_array( $ajustes ) || ! $ajustes ) return $mal( '«' . $nombre . '» necesita {ajuste: valor}.' );
+            $actual    = $antes[ $nombre ];
+            $candidato = $actual;
+            foreach ( $ajustes as $k => $val ) {
+                if ( ! array_key_exists( $k, $actual ) ) return $mal( '«' . $nombre . '.' . $k . '» no existe. Ese módulo tiene: ' . implode( ', ', array_keys( $actual ) ) . '.' );
+                if ( in_array( $actual[ $k ], [ 'si', 'no' ], true ) ) {
+                    if ( is_bool( $val ) ) $val = $val ? 'si' : 'no';
+                    if ( ! in_array( $val, [ 'si', 'no' ], true ) ) return $mal( '«' . $nombre . '.' . $k . '» es un interruptor: true o false.' );
+                } elseif ( is_array( $actual[ $k ] ) ) {
+                    if ( ! is_array( $val ) ) return $mal( '«' . $nombre . '.' . $k . '» es una lista.' );
+                    $val = array_values( array_unique( array_map( 'intval', $val ) ) );
+                    foreach ( $val as $pid ) {
+                        $pg = get_post( $pid );
+                        if ( ! $pg || 'page' !== $pg->post_type || 'publish' !== $pg->post_status ) return $mal( '«' . $nombre . '.' . $k . '»: no hay ninguna página publicada con el id ' . $pid . '.' );
+                    }
+                } elseif ( ! is_scalar( $val ) ) {
+                    return $mal( '«' . $nombre . '.' . $k . '» es un valor suelto, no una lista.' );
+                }
+                if ( in_array( $k, (array) ( self::MOTION_COLORES[ $nombre ] ?? [] ), true ) ) {
+                    if ( null === $colores ) {
+                        $kit     = $this->claude_kit_activo();
+                        $colores = is_wp_error( $kit ) ? [] : array_keys( $this->claude_kit_foto( $kit, $this->claude_kit_crudo( (int) $kit->get_id() ) )['colores'] );
+                    }
+                    if ( $colores && ! in_array( (string) $val, $colores, true ) ) return $mal( '«' . $nombre . '.' . $k . '» es el id de un color global del Kit: ' . implode( ', ', $colores ) . '.' );
+                }
+                if ( 'intro' === $nombre && 'logo' === $k && (int) $val ) {
+                    $adj = get_post( (int) $val );
+                    if ( ! $adj || 'attachment' !== $adj->post_type || 'image/svg+xml' !== $adj->post_mime_type ) return $mal( '«intro.logo» es el id de un SVG de la biblioteca de medios (0 para ninguno).' );
+                }
+                $candidato[ $k ] = $val;
+            }
+            try {
+                $norm = self::claude_motion_simular( $clases[ $nombre ], $candidato );
+            } catch ( \Throwable $e ) {
+                return new \WP_Error( 'co_motion', 'Motion ha dado un error al comprobar «' . $nombre . '»: ' . $e->getMessage() . '. No se ha guardado nada.', [ 'status' => 500 ] );
+            }
+            foreach ( $ajustes as $k => $val ) {
+                if ( ! self::claude_motion_igual( $norm[ $k ] ?? null, $candidato[ $k ] ) ) {
+                    $dicho = is_scalar( $candidato[ $k ] ) ? (string) $candidato[ $k ] : wp_json_encode( $candidato[ $k ] );
+                    $queda = is_scalar( $norm[ $k ] ?? '' ) ? (string) ( $norm[ $k ] ?? '' ) : wp_json_encode( $norm[ $k ] );
+                    return $mal( '«' . $nombre . '.' . $k . '»: Motion no admite «' . $dicho . '» (lo dejaría en «' . $queda . '»).' );
+                }
+            }
+            foreach ( $norm as $k => $val ) {
+                if ( ! self::claude_motion_igual( $actual[ $k ] ?? null, $val ) ) $cambios[ $nombre . '.' . $k ] = [ 'antes' => $actual[ $k ] ?? null, 'despues' => $val ];
+            }
+            $nuevos[ $nombre ] = $norm;
+        }
+
+        $respuesta = [ 'cambios' => (object) $cambios ];
+        if ( ! empty( $p['probar'] ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => self::claude_motion_huella( $antes ) ];
+        }
+        foreach ( $nuevos as $nombre => $norm ) {
+            update_option( constant( $clases[ $nombre ] . '::OPTION_KEY' ), $norm );
+        }
+        $this->claude_registrar( 'motion', 0, implode( ', ', array_keys( $cambios ) ) );
+        $ahora = $this->claude_motion_todo();
+        return $respuesta + [ 'guardado' => true, 'version' => is_wp_error( $ahora ) ? '' : self::claude_motion_huella( $ahora ) ];
     }
 
     public function claude_revisiones( \WP_REST_Request $request ) {
@@ -4276,7 +5031,13 @@ class Caracool_OneStep {
         $revision = $con_revision ? $this->claude_crear_revision( $id ) : null;
 
         $data = [ 'elements' => $elements ];
-        if ( $estado ) $data['settings'] = [ 'post_status' => $estado ];
+        if ( $estado ) {
+            // El save() de Elementor sustituye todos los ajustes de la página por
+            // los que recibe. Si solo se le manda el estado, borra los demás
+            // (ocultar el título, la plantilla de la página, sus márgenes…).
+            $actuales         = get_post_meta( $id, self::KIT_META, true );
+            $data['settings'] = array_merge( is_array( $actuales ) ? $actuales : [], [ 'post_status' => $estado ] );
+        }
 
         try {
             $ok = $doc->save( $data );
