@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.7
+ * Version:     1.5.8
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.7' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.8' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1824,6 +1824,14 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/motion', [
             'methods' => \WP_REST_Server::READABLE, 'callback' => [ $this, 'claude_motion' ], 'permission_callback' => $perm,
         ] );
+        // 1.5.8: plantillas del maquetador de temas (cabecera, pie…) y sus condiciones.
+        register_rest_route( $ns, '/elementor/plantillas', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_plantillas' ],      'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_plantilla_crear' ], 'permission_callback' => $perm ],
+        ] );
+        register_rest_route( $ns, '/elementor/plantillas/(?P<id>\d+)/condiciones', [
+            'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_plantilla_condiciones_guardar' ], 'permission_callback' => $perm,
+        ] );
         // 1.5.7: el Kit también se guarda (colores, tipografías y Estilo del tema), con copias para volver atrás.
         register_rest_route( $ns, '/elementor/kit', [
             [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_kit' ],         'permission_callback' => $perm ],
@@ -2422,7 +2430,7 @@ class Caracool_OneStep {
                 if ( isset( $t['nombre'] ) && is_scalar( $t['nombre'] ) && '' !== trim( (string) $t['nombre'] ) ) $item['title'] = sanitize_text_field( (string) $t['nombre'] );
                 if ( array_key_exists( 'fuente', $t ) ) {
                     $f = is_scalar( $t['fuente'] ) ? sanitize_text_field( (string) $t['fuente'] ) : '';
-                    if ( '' === $f || strlen( $f ) > 80 ) throw new \InvalidArgumentException( '«fuente» es el nombre de la familia (Syne, DM Sans…).' );
+                    if ( '' === $f || strlen( $f ) > 80 ) throw new \InvalidArgumentException( '«fuente» es el nombre de la familia, tal como sale en Elementor.' );
                     $item['typography_font_family'] = $f;
                 }
                 if ( array_key_exists( 'peso', $t ) ) {
@@ -3042,6 +3050,269 @@ class Caracool_OneStep {
             'version' => $version,
             'avisos'  => $avisos,
         ];
+    }
+
+    // ── Plantillas del maquetador de temas (1.5.8) ──
+    // Cabecera, pie y demás plantillas con condiciones. Las crea la función de
+    // Elementor y las condiciones las guarda el gestor de Elementor Pro: aquí
+    // solo se comprueba lo que llega. El contenido se edita después como el de
+    // cualquier página, por /elementor/{id}.
+
+    /** El gestor de condiciones de Elementor Pro, o el WP_Error que toque. */
+    private function claude_plantillas_gestor() {
+        if ( ! $this->claude_elementor_listo() ) return $this->claude_sin_elementor();
+        if ( ! class_exists( '\ElementorPro\Modules\ThemeBuilder\Module' ) ) {
+            return new \WP_Error( 'co_sin_maquetador', 'Esta web no tiene el maquetador de temas de Elementor Pro.', [ 'status' => 404 ] );
+        }
+        try {
+            $g = \ElementorPro\Modules\ThemeBuilder\Module::instance()->get_conditions_manager();
+        } catch ( \Throwable $e ) {
+            $g = null;
+        }
+        if ( ! is_object( $g ) || ! method_exists( $g, 'save_conditions' ) ) {
+            return new \WP_Error( 'co_sin_maquetador', 'El maquetador de temas de esta web no deja guardar condiciones.', [ 'status' => 500 ] );
+        }
+        return $g;
+    }
+
+    /** Solo un Administrador: una cabecera o un pie cambian toda la web. */
+    private function claude_puede_plantillas() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new \WP_Error( 'co_sin_diseno', 'Una plantilla del maquetador de temas cambia toda la web: solo la toca un Administrador.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    /** Tipos de plantilla que admiten condiciones en esta web: tipo => nombre. */
+    private function claude_plantillas_tipos() {
+        $tipos = [];
+        $docs  = \Elementor\Plugin::$instance->documents;
+        foreach ( (array) ( method_exists( $docs, 'get_document_types' ) ? $docs->get_document_types() : [] ) as $tipo => $clase ) {
+            try {
+                if ( ! is_string( $tipo ) || ! $clase::get_property( 'support_conditions' ) ) continue;
+                if ( ! in_array( 'elementor_library', (array) $clase::get_property( 'cpt' ), true ) ) continue;
+                $tipos[ $tipo ] = wp_strip_all_tags( (string) call_user_func( [ $clase, 'get_title' ] ) );
+            } catch ( \Throwable $e ) {
+                continue;
+            }
+        }
+        return $tipos;
+    }
+
+    /**
+     * Las condiciones que llegan ("include/general", "exclude/singular/page/12")
+     * en la forma que guarda Elementor. Lanza InvalidArgumentException.
+     */
+    private static function claude_plantilla_condiciones( $lista, $gestor ) {
+        if ( null === $lista ) return [];
+        if ( ! is_array( $lista ) ) throw new \InvalidArgumentException( '"condiciones" es una lista, por ejemplo ["include/general"].' );
+        $fuera = [];
+        foreach ( $lista as $v ) {
+            $v = is_scalar( $v ) ? trim( (string) $v, " /\t\n\r" ) : '';
+            if ( ! preg_match( '#^(include|exclude)/([a-z0-9_-]+)(?:/([a-z0-9_-]+))?(?:/([A-Za-z0-9_-]+))?$#', $v, $m ) ) {
+                throw new \InvalidArgumentException( 'Una condición va así: "include/general" (todo el sitio), "include/singular/front_page" o "exclude/singular/page/12".' );
+            }
+            $m = array_pad( $m, 5, '' );
+            foreach ( [ $m[2], $m[3] ] as $nombre ) {
+                if ( '' !== $nombre && method_exists( $gestor, 'get_condition' ) && ! $gestor->get_condition( $nombre ) ) {
+                    throw new \InvalidArgumentException( sprintf( 'Elementor no conoce la condición «%s» en esta web.', $nombre ) );
+                }
+            }
+            $fuera[ $v ] = [ 'type' => $m[1], 'name' => $m[2], 'sub_name' => $m[3], 'sub_id' => $m[4] ];
+        }
+        return array_values( $fuera );
+    }
+
+    private function claude_plantilla_ficha( $id ) {
+        $c = get_post_meta( $id, '_elementor_conditions', true );
+        return [
+            'id'          => (int) $id,
+            'titulo'      => get_the_title( $id ),
+            'tipo'        => (string) get_post_meta( $id, '_elementor_template_type', true ),
+            'estado'      => get_post_status( $id ),
+            'condiciones' => is_array( $c ) ? array_values( array_map( 'strval', $c ) ) : [],
+        ];
+    }
+
+    /** Ids de las plantillas con condiciones, las últimas modificadas primero. */
+    private function claude_plantillas_ids( array $tipos ) {
+        if ( ! $tipos ) return [];
+        return array_map( 'intval', (array) get_posts( [
+            'post_type'        => 'elementor_library',
+            'post_status'      => [ 'publish', 'draft', 'private', 'pending' ],
+            'numberposts'      => 200,
+            'fields'           => 'ids',
+            'orderby'          => 'modified',
+            'order'            => 'DESC',
+            'suppress_filters' => true,
+            'meta_query'       => [ [ 'key' => '_elementor_template_type', 'value' => array_keys( $tipos ), 'compare' => 'IN' ] ],
+        ] ) );
+    }
+
+    /** Avisa si otra plantilla publicada del mismo tipo tiene ya la misma condición. */
+    private function claude_plantilla_choques( $id, array $tipos ) {
+        $yo = $this->claude_plantilla_ficha( $id );
+        if ( 'publish' !== $yo['estado'] || ! $yo['condiciones'] ) return [];
+        $avisos = [];
+        foreach ( $this->claude_plantillas_ids( $tipos ) as $otro ) {
+            if ( $otro === (int) $id ) continue;
+            $o = $this->claude_plantilla_ficha( $otro );
+            if ( 'publish' !== $o['estado'] || $o['tipo'] !== $yo['tipo'] ) continue;
+            $comunes = array_values( array_filter( array_intersect( $yo['condiciones'], $o['condiciones'] ), function ( $c ) { return 0 === strpos( $c, 'include/' ); } ) );
+            if ( $comunes ) {
+                $avisos[] = sprintf( 'La plantilla «%s» (id %d) es del mismo tipo y tiene la misma condición (%s): Elementor solo enseñará una de las dos.', $o['titulo'], $otro, implode( ', ', $comunes ) );
+            }
+        }
+        return $avisos;
+    }
+
+    /** GET /elementor/plantillas: las plantillas con condiciones y los tipos que admite la web. */
+    public function claude_plantillas( $request = null ) {
+        $g = $this->claude_plantillas_gestor();
+        if ( is_wp_error( $g ) ) return $g;
+        $tipos = $this->claude_plantillas_tipos();
+        $lista = [];
+        foreach ( $this->claude_plantillas_ids( $tipos ) as $id ) $lista[] = $this->claude_plantilla_ficha( $id );
+        return [
+            'plantillas' => $lista,
+            'tipos'      => $tipos,
+            'como'       => 'Condiciones como las guarda Elementor: "include/general" es todo el sitio; "include/singular/front_page", la portada; "exclude/singular/page/12", todas menos la página 12. El contenido se lee y se guarda por /elementor/{id}, como una página.',
+        ];
+    }
+
+    /**
+     * POST /elementor/plantillas: crea una plantilla del maquetador de temas.
+     * Body: titulo, tipo (header, footer…), [condiciones], [estado=draft],
+     * [elements], [idioma].
+     */
+    public function claude_plantilla_crear( \WP_REST_Request $request ) {
+        $puede = $this->claude_puede_plantillas();
+        if ( is_wp_error( $puede ) ) return $puede;
+        $g = $this->claude_plantillas_gestor();
+        if ( is_wp_error( $g ) ) return $g;
+
+        $titulo = sanitize_text_field( (string) $request->get_param( 'titulo' ) );
+        if ( '' === $titulo ) return new \WP_Error( 'co_titulo', 'Falta "titulo".', [ 'status' => 400 ] );
+
+        $tipos = $this->claude_plantillas_tipos();
+        $tipo  = sanitize_key( (string) $request->get_param( 'tipo' ) );
+        if ( ! isset( $tipos[ $tipo ] ) ) {
+            return new \WP_Error( 'co_tipo', '"tipo" tiene que ser uno de: ' . implode( ', ', array_keys( $tipos ) ) . '.', [ 'status' => 400 ] );
+        }
+
+        $estado = (string) ( $request->get_param( 'estado' ) ?: 'draft' );
+        if ( ! in_array( $estado, [ 'publish', 'draft' ], true ) ) {
+            return new \WP_Error( 'co_estado', '"estado" es "draft" o "publish".', [ 'status' => 400 ] );
+        }
+
+        try {
+            $condiciones = self::claude_plantilla_condiciones( $request->get_param( 'condiciones' ), $g );
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_condicion', $e->getMessage(), [ 'status' => 400 ] );
+        }
+
+        $elements = $request->get_param( 'elements' );
+        if ( null !== $elements ) {
+            $error = is_array( $elements ) ? self::claude_validar_arbol( $elements ) : '"elements" tiene que ser un array.';
+            if ( $error ) return new \WP_Error( 'co_arbol', $error, [ 'status' => 400 ] );
+        }
+
+        // Todo comprobado: a partir de aquí se escribe.
+        try {
+            $doc = \Elementor\Plugin::$instance->documents->create( $tipo, [ 'post_title' => $titulo, 'post_status' => $estado ] );
+        } catch ( \Throwable $e ) {
+            return new \WP_Error( 'co_crear', 'Elementor ha dado un error al crear la plantilla: ' . $e->getMessage(), [ 'status' => 500 ] );
+        }
+        if ( is_wp_error( $doc ) ) return $doc;
+        $id = is_object( $doc ) && method_exists( $doc, 'get_main_id' ) ? (int) $doc->get_main_id() : 0;
+        if ( ! $id || 'elementor_library' !== get_post_type( $id ) ) {
+            return new \WP_Error( 'co_crear', 'Elementor no ha creado la plantilla.', [ 'status' => 500 ] );
+        }
+
+        // Idioma de WPML, como en las páginas.
+        $idioma = null;
+        if ( defined( 'ICL_SITEPRESS_VERSION' ) ) {
+            $idioma = sanitize_key( (string) $request->get_param( 'idioma' ) ) ?: apply_filters( 'wpml_default_language', null );
+            do_action( 'wpml_set_element_language_details', [
+                'element_id'           => $id,
+                'element_type'         => 'post_elementor_library',
+                'trid'                 => null,
+                'language_code'        => $idioma,
+                'source_language_code' => null,
+            ] );
+        }
+
+        if ( $condiciones ) {
+            try {
+                $g->save_conditions( $id, $condiciones );
+            } catch ( \Throwable $e ) {
+                return new \WP_Error( 'co_condicion', 'La plantilla ' . $id . ' se ha creado, pero Elementor ha dado un error al guardar sus condiciones: ' . $e->getMessage(), [ 'status' => 500, 'id' => $id ] );
+            }
+        }
+
+        $avisos = [];
+        if ( is_array( $elements ) && $elements ) {
+            $guardado = $this->claude_guardar_documento( $id, $elements, '', false );
+            if ( is_wp_error( $guardado ) ) return $guardado;
+            $avisos = $guardado['avisos'];
+        } elseif ( '' === (string) get_post_meta( $id, '_elementor_data', true ) ) {
+            update_post_meta( $id, '_elementor_data', '[]' );
+        }
+
+        $ficha = $this->claude_plantilla_ficha( $id );
+        if ( ! $ficha['condiciones'] ) $avisos[] = 'Sin condiciones, la plantilla no se enseña en ninguna parte.';
+        if ( 'publish' !== $ficha['estado'] ) $avisos[] = 'Está en borrador: no se ve en la web hasta publicarla.';
+
+        $this->claude_registrar( 'crear_plantilla', $id, $tipo . ( $ficha['condiciones'] ? ' · ' . implode( ', ', $ficha['condiciones'] ) : '' ) );
+        return $ficha + [
+            'idioma'  => $idioma,
+            'version' => $this->claude_huella( $this->claude_datos_crudos( $id ) ),
+            'avisos'  => array_merge( $avisos, $this->claude_plantilla_choques( $id, $tipos ) ),
+        ];
+    }
+
+    /**
+     * POST /elementor/plantillas/{id}/condiciones: cambia dónde se enseña una
+     * plantilla. Body: condiciones (lista; vacía = en ninguna parte).
+     */
+    public function claude_plantilla_condiciones_guardar( \WP_REST_Request $request ) {
+        $puede = $this->claude_puede_plantillas();
+        if ( is_wp_error( $puede ) ) return $puede;
+        $g = $this->claude_plantillas_gestor();
+        if ( is_wp_error( $g ) ) return $g;
+
+        $id    = (int) $request['id'];
+        $tipos = $this->claude_plantillas_tipos();
+        $post  = get_post( $id );
+        if ( ! $post || 'elementor_library' !== $post->post_type || 'trash' === $post->post_status
+            || ! isset( $tipos[ (string) get_post_meta( $id, '_elementor_template_type', true ) ] ) ) {
+            return new \WP_Error( 'co_plantilla', 'No hay ninguna plantilla del maquetador de temas con ese id.', [ 'status' => 404 ] );
+        }
+
+        $lista = $request->get_param( 'condiciones' );
+        if ( ! is_array( $lista ) ) {
+            return new \WP_Error( 'co_condicion', 'Falta "condiciones": una lista, por ejemplo ["include/general"]. Vacía, la plantilla deja de enseñarse.', [ 'status' => 400 ] );
+        }
+        try {
+            $condiciones = self::claude_plantilla_condiciones( $lista, $g );
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_condicion', $e->getMessage(), [ 'status' => 400 ] );
+        }
+
+        $antes = $this->claude_plantilla_ficha( $id )['condiciones'];
+        try {
+            $g->save_conditions( $id, $condiciones );
+        } catch ( \Throwable $e ) {
+            return new \WP_Error( 'co_condicion', 'Elementor ha dado un error al guardar las condiciones: ' . $e->getMessage(), [ 'status' => 500 ] );
+        }
+
+        $ficha  = $this->claude_plantilla_ficha( $id );
+        $avisos = $this->claude_plantilla_choques( $id, $tipos );
+        if ( ! $ficha['condiciones'] ) $avisos[] = 'Sin condiciones, la plantilla no se enseña en ninguna parte.';
+        if ( 'publish' !== $ficha['estado'] ) $avisos[] = 'Está en borrador: no se ve en la web hasta publicarla.';
+
+        $this->claude_registrar( 'condiciones_plantilla', $id, implode( ', ', $ficha['condiciones'] ) ?: 'ninguna' );
+        return $ficha + [ 'antes' => $antes, 'avisos' => $avisos ];
     }
 
     /**
