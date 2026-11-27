@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.10
+ * Version:     1.5.11
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.10' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.11' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1964,6 +1964,11 @@ class Caracool_OneStep {
             [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_redirecciones' ],         'permission_callback' => $perm ],
             [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_redirecciones_guardar' ], 'permission_callback' => $perm ],
         ] );
+        // 1.5.11: título y descripción para buscadores de una página (Yoast SEO).
+        register_rest_route( $ns, '/seo/(?P<id>\d+)', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_seo' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_seo_guardar' ], 'permission_callback' => $perm ],
+        ] );
     }
 
     /**
@@ -2042,6 +2047,8 @@ class Caracool_OneStep {
             'wpml'          => defined( 'ICL_SITEPRESS_VERSION' ) ? ICL_SITEPRESS_VERSION : null,
             // Caracool Motion no está en todas las webs: null = no hay efectos de movimiento.
             'motion'        => $this->claude_hay_motion() ? CARACOOL_MOTION_VERSION : null,
+            // 1.5.11: plugin de SEO con el que se puede leer y cambiar el título y la descripción de cada página.
+            'seo'           => $this->claude_hay_yoast() ? 'yoast' : null,
             'idiomas'       => $idiomas,
             'idioma_defecto'=> $idiomas ? apply_filters( 'wpml_default_language', null ) : null,
             'usuario'       => wp_get_current_user()->user_login,
@@ -5937,6 +5944,148 @@ class Caracool_OneStep {
 
     private function claude_elementor_listo() {
         return class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance ) && defined( 'ELEMENTOR_VERSION' );
+    }
+
+    // ── 1.5.11: título y descripción para buscadores de una página (Yoast SEO) ──
+    // Yoast guarda lo propio de cada página en dos metadatos (_yoast_wpseo_title y
+    // _yoast_wpseo_metadesc) que la REST de WordPress no deja escribir. Vacío = vale
+    // la plantilla general de Yoast (la de opciones_plugin).
+
+    const SEO_CAMPOS = [ 'titulo' => 'title', 'descripcion' => 'metadesc' ];
+    const SEO_MAXIMO = [ 'titulo' => 200, 'descripcion' => 320 ];
+
+    private function claude_hay_yoast() {
+        return defined( 'WPSEO_VERSION' ) && class_exists( '\WPSEO_Meta' );
+    }
+
+    private function claude_sin_yoast() {
+        return new \WP_Error( 'co_sin_seo', 'Esta web no tiene activo Yoast SEO (se instala con instalar_plugin, slug «wordpress-seo»).', [ 'status' => 404 ] );
+    }
+
+    /** Lo propio de la página, tal como está guardado. */
+    private function claude_seo_guardado( $id ) {
+        $out = [];
+        foreach ( self::SEO_CAMPOS as $nombre => $clave ) {
+            $out[ $nombre ] = (string) get_post_meta( $id, '_yoast_wpseo_' . $clave, true );
+        }
+        return $out;
+    }
+
+    private static function claude_seo_huella( array $guardado ) {
+        return substr( md5( (string) wp_json_encode( $guardado ) ), 0, 16 );
+    }
+
+    /** Lo que Yoast pone de verdad en la página, con su plantilla ya aplicada. null si no lo da. */
+    private function claude_seo_efectivo( $id ) {
+        if ( ! function_exists( 'YoastSEO' ) ) return null;
+        try {
+            $m = YoastSEO()->meta->for_post( $id );
+            return $m ? [ 'titulo' => (string) $m->title, 'descripcion' => (string) $m->description ] : null;
+        } catch ( \Throwable $e ) {
+            return null;
+        }
+    }
+
+    /** Rehace la ficha que Yoast guarda de la página (su «indexable»), que es de donde saca las etiquetas. */
+    private function claude_seo_reindexar( $id ) {
+        if ( ! function_exists( 'YoastSEO' ) ) return false;
+        try {
+            $clases = YoastSEO()->classes;
+            $ficha  = $clases->get( 'Yoast\WP\SEO\Repositories\Indexable_Repository' )->find_by_id_and_type( $id, 'post', false );
+            $clases->get( 'Yoast\WP\SEO\Builders\Indexable_Builder' )->build_for_id_and_type( $id, 'post', $ficha ?: false );
+            return true;
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+    }
+
+    /** Un texto para buscadores: una sola línea, sin HTML. Lanza si es demasiado largo o no es texto. */
+    private static function claude_seo_texto( $nombre, $valor ) {
+        if ( null === $valor ) return '';
+        if ( ! is_string( $valor ) ) throw new \InvalidArgumentException( '«' . $nombre . '» es un texto (o null para quitarlo).' );
+        $limpio = trim( (string) preg_replace( '/\s+/u', ' ', wp_strip_all_tags( $valor ) ) );
+        if ( $limpio !== trim( (string) preg_replace( '/\s+/u', ' ', $valor ) ) ) throw new \InvalidArgumentException( '«' . $nombre . '» no admite HTML.' );
+        $max = self::SEO_MAXIMO[ $nombre ];
+        if ( mb_strlen( $limpio ) > $max ) throw new \InvalidArgumentException( sprintf( '«%s» tiene %d caracteres y el máximo es %d.', $nombre, mb_strlen( $limpio ), $max ) );
+        return $limpio;
+    }
+
+    /** GET /seo/{id}: título y descripción propios de la página, lo que sale de verdad y la «version». */
+    public function claude_seo( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+        if ( ! $this->claude_hay_yoast() ) return $this->claude_sin_yoast();
+        $guardado = $this->claude_seo_guardado( $id );
+        return [
+            'id'            => $id,
+            'titulo_pagina' => get_the_title( $id ),
+            'tipo'          => $post->post_type ?? '',
+            'estado'        => $post->post_status ?? '',
+            'url'           => get_permalink( $id ),
+            'plugin'        => 'yoast',
+            'version'       => self::claude_seo_huella( $guardado ),
+            'seo'           => $guardado,
+            'efectivo'      => $this->claude_seo_efectivo( $id ),
+            'maximos'       => self::SEO_MAXIMO,
+            'nota'          => 'Para cambiar: POST con {version, titulo?, descripcion?, probar?}. Un texto vacío o null quita el propio de la página y vuelve a valer la plantilla de Yoast. «seo» es lo guardado en la página; «efectivo», lo que Yoast pone en el HTML. Google suele enseñar unos 60 caracteres de título y 155 de descripción.',
+        ];
+    }
+
+    /** POST /seo/{id} {version, titulo?, descripcion?, probar?, forzar?}. Solo cambia lo que se manda. */
+    public function claude_seo_guardar( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+        if ( ! $this->claude_hay_yoast() ) return $this->claude_sin_yoast();
+        $lock = $this->claude_bloqueo( $id );
+        if ( $lock && ! $request->get_param( 'forzar' ) ) {
+            return new \WP_Error( 'co_bloqueada', sprintf( '%s tiene la página abierta en el editor ahora mismo: al guardar pisaría este cambio. Espera a que la cierre.', $lock->display_name ), [ 'status' => 423 ] );
+        }
+        $antes = $this->claude_seo_guardado( $id );
+        $v     = (string) $request->get_param( 'version' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta "version": lee antes el SEO de la página (GET /seo/{id}).', [ 'status' => 428 ] );
+        if ( ! hash_equals( self::claude_seo_huella( $antes ), $v ) ) return new \WP_Error( 'co_cambiada', 'El título o la descripción han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
+
+        $cuerpo  = (array) $request->get_json_params();
+        $despues = $antes;
+        $pedidos = 0;
+        try {
+            foreach ( array_keys( self::SEO_CAMPOS ) as $nombre ) {
+                if ( ! array_key_exists( $nombre, $cuerpo ) ) continue;
+                $pedidos++;
+                $despues[ $nombre ] = self::claude_seo_texto( $nombre, $cuerpo[ $nombre ] );
+            }
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_seo', $e->getMessage() . ' No se ha guardado nada.', [ 'status' => 400 ] );
+        }
+        if ( ! $pedidos ) return new \WP_Error( 'co_seo', 'No hay nada que cambiar: manda «titulo» o «descripcion».', [ 'status' => 400 ] );
+
+        $cambios = [];
+        foreach ( $despues as $nombre => $valor ) {
+            if ( $valor !== $antes[ $nombre ] ) $cambios[ $nombre ] = [ 'antes' => $antes[ $nombre ], 'despues' => $valor ];
+        }
+        $respuesta = [ 'id' => $id, 'cambios' => (object) $cambios ];
+        if ( $request->get_param( 'probar' ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => $v ];
+        }
+
+        foreach ( array_keys( $cambios ) as $nombre ) {
+            $meta = '_yoast_wpseo_' . self::SEO_CAMPOS[ $nombre ];
+            if ( '' === $despues[ $nombre ] ) delete_post_meta( $id, $meta );
+            else update_post_meta( $id, $meta, wp_slash( $despues[ $nombre ] ) );
+        }
+        $reindexado = $this->claude_seo_reindexar( $id );
+        $this->claude_registrar( 'seo', $id, implode( ', ', array_keys( $cambios ) ) );
+        $guardado = $this->claude_seo_guardado( $id );
+        return $respuesta + [
+            'guardado'   => true,
+            'version'    => self::claude_seo_huella( $guardado ),
+            'seo'        => $guardado,
+            'efectivo'   => $this->claude_seo_efectivo( $id ),
+            'reindexado' => $reindexado,
+            'url'        => get_permalink( $id ),
+        ];
     }
 
     private function claude_sin_elementor() {
