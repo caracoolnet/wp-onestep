@@ -3,7 +3,7 @@
  * Plugin Name: Caracool OneStep
  * Plugin URI:  https://caracool.net
  * Description: Desactiva los comentarios en todo el sitio, activa un modo de mantenimiento con página personalizable, inserta código personalizado en el head/footer, permite duplicar páginas y entradas y conecta la web con Claude para editar Elementor. Plugin ligero de Caracool, sin dependencias externas.
- * Version:     1.5.11
+ * Version:     1.5.12
  * Author:      Caracool
  * Author URI:  https://caracool.net
  * Text Domain: caracool-onestep
@@ -12,7 +12,7 @@
 // ── Bloquear acceso directo al archivo ────────────────────────
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'CARACOOL_ONESTEP_VERSION', '1.5.11' );
+define( 'CARACOOL_ONESTEP_VERSION', '1.5.12' );
 define( 'CARACOOL_ONESTEP_PATH',    plugin_dir_path( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_URL',     plugin_dir_url( __FILE__ ) );
 define( 'CARACOOL_ONESTEP_SLUG',    'caracool-onestep' );
@@ -1968,6 +1968,11 @@ class Caracool_OneStep {
         register_rest_route( $ns, '/seo/(?P<id>\d+)', [
             [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_seo' ],         'permission_callback' => $perm ],
             [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_seo_guardar' ], 'permission_callback' => $perm ],
+        ] );
+        // 1.5.12: campos propios de una página (metadatos del tema y de los plugins).
+        register_rest_route( $ns, '/campos/(?P<id>\d+)', [
+            [ 'methods' => \WP_REST_Server::READABLE,  'callback' => [ $this, 'claude_campos' ],         'permission_callback' => $perm ],
+            [ 'methods' => \WP_REST_Server::CREATABLE, 'callback' => [ $this, 'claude_campos_guardar' ], 'permission_callback' => $perm ],
         ] );
     }
 
@@ -6085,6 +6090,202 @@ class Caracool_OneStep {
             'efectivo'   => $this->claude_seo_efectivo( $id ),
             'reindexado' => $reindexado,
             'url'        => get_permalink( $id ),
+        ];
+    }
+
+    // ── 1.5.12: campos propios de una página (metadatos) ──
+    // Los temas y los plugins guardan opciones por página en metadatos propios
+    // (p. ej. «harington-opt-page-bknd-color-code»), que la REST de WordPress no
+    // enseña. Esto vale para cualquier tema: enseña lo que tiene la página y cambia
+    // solo las claves que se piden. Lo de WordPress, Elementor, Yoast y WPML queda
+    // fuera: tiene sus propias herramientas o no se toca a mano.
+
+    const CAMPOS_FUERA = [ '_elementor', '_edit_', '_wp_', '_yoast_wpseo_', '_icl_', '_wpml', 'wpml_', '_oembed_', '_encloseme', '_pingme', '_menu_item_', '_thumbnail_id', '_trash' ];
+    const CAMPOS_LARGO = 2000;     // en la lista, los textos más largos se cortan (pedir la clave para verlo entero)
+    const CAMPOS_MAXIMO = 100000;  // tamaño máximo de un valor nuevo
+
+    private static function claude_campo_fuera( $clave ) {
+        foreach ( self::CAMPOS_FUERA as $pre ) {
+            if ( 0 === strpos( $clave, $pre ) ) return true;
+        }
+        return false;
+    }
+
+    /** Todos los metadatos visibles de la página: [clave => [valores ya deserializados]]. */
+    private function claude_campos_todos( $id ) {
+        $out = [];
+        foreach ( (array) get_post_custom( $id ) as $clave => $valores ) {
+            $clave = (string) $clave;
+            if ( '' === $clave || self::claude_campo_fuera( $clave ) ) continue;
+            $out[ $clave ] = array_map( 'maybe_unserialize', (array) $valores );
+        }
+        ksort( $out, SORT_STRING );
+        return $out;
+    }
+
+    private static function claude_campos_huella( array $todos ) {
+        return substr( md5( (string) serialize( $todos ) ), 0, 16 );
+    }
+
+    private static function claude_campo_tipo( $v ) {
+        if ( is_array( $v ) || is_object( $v ) ) return 'lista';
+        if ( is_bool( $v ) ) return 'si_no';
+        if ( is_int( $v ) || is_float( $v ) || ( is_string( $v ) && '' !== $v && is_numeric( $v ) ) ) return 'numero';
+        if ( '' === $v || null === $v ) return 'vacio';
+        return 'texto';
+    }
+
+    /** Lo que se enseña de un campo. $entero: sin cortar los textos largos. */
+    private function claude_campo_salida( $id, $clave, array $valores, $entero ) {
+        $v   = $valores[0] ?? '';
+        $out = [ 'tipo' => self::claude_campo_tipo( $v ) ];
+        if ( is_object( $v ) ) $v = json_decode( (string) wp_json_encode( $v ), true );
+        if ( is_string( $v ) && ! $entero && mb_strlen( $v ) > self::CAMPOS_LARGO ) {
+            $out['valor']   = mb_substr( $v, 0, self::CAMPOS_LARGO );
+            $out['cortado'] = mb_strlen( $v );
+        } else {
+            $out['valor'] = $v;
+        }
+        if ( count( $valores ) > 1 ) $out['repetido'] = count( $valores );
+        if ( '_' === $clave[0] ) $out['protegido'] = true;
+        // ACF: la clave con guion bajo delante guarda la referencia del campo; de ahí sale su etiqueta.
+        if ( function_exists( 'get_field_object' ) && '_' !== $clave[0] ) {
+            $ref = get_post_meta( $id, '_' . $clave, true );
+            if ( is_string( $ref ) && 0 === strpos( $ref, 'field_' ) ) {
+                $f = get_field_object( $ref, $id, false, false );
+                if ( is_array( $f ) ) $out['acf'] = [ 'etiqueta' => (string) ( $f['label'] ?? '' ), 'tipo' => (string) ( $f['type'] ?? '' ) ];
+            }
+        }
+        return $out;
+    }
+
+    /** Un valor nuevo para un campo que ya tiene $actual. Lanza si no vale. */
+    private static function claude_campo_valor( $clave, $nuevo, $actual, $existe ) {
+        if ( is_bool( $nuevo ) ) throw new \InvalidArgumentException( '«' . $clave . '»: manda el valor tal como lo guarda el tema ("1", "0", "on", "yes"…), no true/false.' );
+        if ( is_int( $nuevo ) || is_float( $nuevo ) ) $nuevo = (string) $nuevo;
+        if ( is_array( $nuevo ) ) {
+            if ( $existe && ! is_array( $actual ) && ! is_object( $actual ) ) throw new \InvalidArgumentException( '«' . $clave . '» guarda un texto, no una lista.' );
+        } elseif ( is_string( $nuevo ) ) {
+            if ( $existe && ( is_array( $actual ) || is_object( $actual ) ) ) throw new \InvalidArgumentException( '«' . $clave . '» guarda una lista: manda la lista entera.' );
+        } else {
+            throw new \InvalidArgumentException( '«' . $clave . '»: el valor tiene que ser un texto, un número o una lista (o null para quitarlo).' );
+        }
+        $tam = strlen( is_string( $nuevo ) ? $nuevo : (string) wp_json_encode( $nuevo ) );
+        if ( $tam > self::CAMPOS_MAXIMO ) throw new \InvalidArgumentException( sprintf( '«%s» ocupa %d bytes y el máximo es %d.', $clave, $tam, self::CAMPOS_MAXIMO ) );
+        return $nuevo;
+    }
+
+    /** GET /campos/{id}[?claves=a,b]: campos propios de la página, su «version» y, con claves, los valores enteros. */
+    public function claude_campos( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+        $todos  = $this->claude_campos_todos( $id );
+        $pedir  = array_filter( array_map( 'trim', explode( ',', (string) $request->get_param( 'claves' ) ) ), 'strlen' );
+        $campos = [];
+        $faltan = [];
+        if ( $pedir ) {
+            foreach ( $pedir as $c ) {
+                if ( isset( $todos[ $c ] ) ) $campos[ $c ] = $this->claude_campo_salida( $id, $c, $todos[ $c ], true );
+                else $faltan[] = $c;
+            }
+        } else {
+            foreach ( $todos as $c => $valores ) $campos[ $c ] = $this->claude_campo_salida( $id, $c, $valores, false );
+        }
+        // Prefijos comunes (lo que va antes del primer guion o guion bajo): ayudan a ver qué es del tema y qué de cada plugin.
+        $prefijos = [];
+        foreach ( array_keys( $todos ) as $c ) {
+            $p = preg_split( '/[-_]/', ltrim( $c, '_' ), 2 )[0];
+            if ( '' !== $p ) $prefijos[ $p ] = ( $prefijos[ $p ] ?? 0 ) + 1;
+        }
+        arsort( $prefijos );
+        $tema = null;
+        if ( function_exists( 'get_stylesheet' ) ) {
+            $hijo = (string) get_stylesheet();
+            $base = (string) get_template();
+            $tema = [ 'nombre' => (string) wp_get_theme( $hijo )->get( 'Name' ), 'carpeta' => $hijo, 'padre' => $base !== $hijo ? $base : null ];
+        }
+        $out  = [
+            'id'       => $id,
+            'titulo'   => get_the_title( $id ),
+            'tipo'     => $post->post_type ?? '',
+            'estado'   => $post->post_status ?? '',
+            'url'      => get_permalink( $id ),
+            'tema'     => $tema,
+            'version'  => self::claude_campos_huella( $todos ),
+            'total'    => count( $todos ),
+            'prefijos' => (object) $prefijos,
+            'campos'   => (object) $campos,
+            'nota'     => 'Solo salen los campos que la página tiene guardados. No salen los de WordPress, Elementor, Yoast ni WPML (van por sus herramientas). Para cambiar: POST con {version, campos: {clave: valor}}; null quita el campo; probar=true enseña el antes y el después. Una clave que la página no tiene solo se crea con nuevos=true. Los textos de más de ' . self::CAMPOS_LARGO . ' caracteres salen cortados («cortado» dice el largo): pide ?claves=clave para verlos enteros.',
+        ];
+        if ( $faltan ) $out['no_estan'] = $faltan;
+        return $out;
+    }
+
+    /** POST /campos/{id} {version, campos:{clave: valor|null}, nuevos?, probar?, forzar?}. Solo cambia las claves que se mandan. */
+    public function claude_campos_guardar( \WP_REST_Request $request ) {
+        $id   = (int) $request['id'];
+        $post = $this->claude_post_editable( $id );
+        if ( is_wp_error( $post ) ) return $post;
+        $lock = $this->claude_bloqueo( $id );
+        if ( $lock && ! $request->get_param( 'forzar' ) ) {
+            return new \WP_Error( 'co_bloqueada', sprintf( '%s tiene la página abierta en el editor ahora mismo: al guardar podría pisar este cambio. Espera a que la cierre.', $lock->display_name ), [ 'status' => 423 ] );
+        }
+        $todos = $this->claude_campos_todos( $id );
+        $v     = (string) $request->get_param( 'version' );
+        if ( '' === $v ) return new \WP_Error( 'co_sin_version', 'Falta "version": lee antes los campos de la página (GET /campos/{id}).', [ 'status' => 428 ] );
+        if ( ! hash_equals( self::claude_campos_huella( $todos ), $v ) ) return new \WP_Error( 'co_cambiada', 'Los campos de la página han cambiado desde que se leyeron: vuelve a leerlos.', [ 'status' => 409 ] );
+
+        $cuerpo = (array) $request->get_json_params();
+        $pide   = $cuerpo['campos'] ?? null;
+        if ( ! is_array( $pide ) || ! $pide ) return new \WP_Error( 'co_campos', 'No hay nada que cambiar: manda «campos» con {clave: valor}.', [ 'status' => 400 ] );
+        $nuevos = ! empty( $cuerpo['nuevos'] );
+        $admin  = current_user_can( 'manage_options' );
+
+        $cambios = [];
+        try {
+            foreach ( $pide as $clave => $valor ) {
+                $clave = (string) $clave;
+                if ( '' === $clave || strlen( $clave ) > 255 || preg_match( '/[\x00-\x1f]/', $clave ) ) throw new \InvalidArgumentException( 'Hay una clave vacía o no válida.' );
+                if ( self::claude_campo_fuera( $clave ) ) throw new \InvalidArgumentException( '«' . $clave . '» es de WordPress, Elementor, Yoast o WPML: no se cambia por aquí.' );
+                $existe = isset( $todos[ $clave ] );
+                if ( $existe && count( $todos[ $clave ] ) > 1 ) throw new \InvalidArgumentException( '«' . $clave . '» tiene ' . count( $todos[ $clave ] ) . ' valores repetidos: no se cambia por aquí.' );
+                if ( ! $existe && ! $nuevos && null !== $valor ) throw new \InvalidArgumentException( 'La página no tiene «' . $clave . '». Si hay que crearlo, manda nuevos=true (comprueba antes el nombre exacto que usa el tema).' );
+                if ( '_' === $clave[0] && ! $admin ) throw new \InvalidArgumentException( '«' . $clave . '» es un campo protegido: solo lo cambia un Administrador.' );
+                if ( '_' !== $clave[0] && ! current_user_can( 'edit_post_meta', $id, $clave ) ) throw new \InvalidArgumentException( 'El usuario de Claude no puede cambiar «' . $clave . '».' );
+                $actual = $existe ? $todos[ $clave ][0] : null;
+                if ( null === $valor ) {
+                    if ( $existe ) $cambios[ $clave ] = [ 'antes' => $actual, 'despues' => null ];
+                    continue;
+                }
+                $valor = self::claude_campo_valor( $clave, $valor, $actual, $existe );
+                $comparar = is_object( $actual ) ? json_decode( (string) wp_json_encode( $actual ), true ) : $actual;
+                if ( $existe && $valor === $comparar ) continue;
+                if ( $existe && is_scalar( $comparar ) && is_string( $valor ) && (string) $comparar === $valor ) continue;
+                $cambios[ $clave ] = [ 'antes' => $existe ? $comparar : null, 'despues' => $valor ];
+            }
+        } catch ( \InvalidArgumentException $e ) {
+            return new \WP_Error( 'co_campos', $e->getMessage() . ' No se ha guardado nada.', [ 'status' => 400 ] );
+        }
+
+        $respuesta = [ 'id' => $id, 'cambios' => (object) $cambios ];
+        if ( $request->get_param( 'probar' ) || ! $cambios ) {
+            return $respuesta + [ 'guardado' => false, 'version' => $v ];
+        }
+        foreach ( $cambios as $clave => $c ) {
+            if ( null === $c['despues'] ) delete_post_meta( $id, $clave );
+            else update_post_meta( $id, $clave, wp_slash( $c['despues'] ) );
+        }
+        if ( function_exists( 'clean_post_cache' ) ) clean_post_cache( $id );
+        // Algunos temas pintan estas opciones dentro del HTML que Elementor guarda en caché.
+        delete_post_meta( $id, '_elementor_element_cache' );
+        $this->claude_registrar( 'campos', $id, implode( ', ', array_keys( $cambios ) ) );
+        $despues = $this->claude_campos_todos( $id );
+        return $respuesta + [
+            'guardado' => true,
+            'version'  => self::claude_campos_huella( $despues ),
+            'url'      => get_permalink( $id ),
+            'nota'     => '«cambios» trae el valor de antes: para deshacerlo, se vuelve a guardar ese valor (o null si no estaba).',
         ];
     }
 
